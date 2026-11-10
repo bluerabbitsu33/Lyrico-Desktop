@@ -1,54 +1,57 @@
-import { CheckSquareOutlined, CloseOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
-import { Button, Empty, Flex, Input, Space, Tooltip, Typography } from "antd";
-import { memo, useCallback } from "react";
+import { FolderAddOutlined, SearchOutlined } from "@ant-design/icons";
+import { Button, Input } from "antd";
+import { memo, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { AudioTrack } from "../app/types";
+import { EmptyState } from "../components/EmptyState";
 import { LibraryTable } from "../components/LibraryTable";
-import { LibrarySelectionToolbar } from "../components/LibrarySelectionToolbar";
-
-const { Title, Text } = Typography;
+import { LibraryRefreshButton } from "../components/LibraryRefreshButton";
+import { PageHeader } from "../components/PageHeader";
+import { SortSelect } from "../components/SortSelect";
+import { trackSortFields, type SortState, type TrackSortField } from "../domain/sort";
 
 export const SongsPage = memo(function SongsPage({
   tracks,
   query,
-  selectedTrack,
-  selectedPath,
   selectedPaths,
   loading,
+  sort,
   onChangeQuery,
-  onSelectTrack,
   onChangeSelectedPaths,
-  onReloadTrack,
+  onSortChange,
   onOpenDetails,
-  selectionMode,
-  onChangeSelectionMode,
-  onOpenBatch,
+  onAddFolders,
+  onRefreshLibrary,
+  canRefreshLibrary,
 }: {
   tracks: AudioTrack[];
   query: string;
-  selectedTrack?: AudioTrack;
-  selectedPath?: string;
   selectedPaths: string[];
   loading: boolean;
+  sort?: SortState<TrackSortField>;
   onChangeQuery: (query: string) => void;
-  onSelectTrack: (path?: string) => void;
   onChangeSelectedPaths: (paths: string[]) => void;
-  onReloadTrack: () => void;
+  onSortChange: (sort?: SortState<TrackSortField>) => void;
   onOpenDetails: (path?: string) => void;
-  selectionMode: boolean;
-  onChangeSelectionMode: (enabled: boolean) => void;
-  onOpenBatch: () => void;
+  onAddFolders: () => void;
+  onRefreshLibrary: () => void;
+  canRefreshLibrary: boolean;
 }) {
   const { t } = useTranslation();
   const handleOpenTrack = useCallback((track: AudioTrack) => onOpenDetails(track.path), [onOpenDetails]);
+  const searching = query.trim().length > 0;
+  const empty = tracks.length === 0 && !loading;
+  const addFolderAction = useMemo(
+    () => <Button type="primary" icon={<FolderAddOutlined />} onClick={onAddFolders}>{t("folders.add")}</Button>,
+    [onAddFolders, t],
+  );
+
   return (
-    <div className="workspace page-stack library-view">
-      <Flex className="library-page-header compact-library-header" justify="space-between" align="center" gap={24}>
-        <div className="library-page-header-copy">
-          <Title level={2}>{t("songs.title")}</Title>
-          <Text type="secondary">{t("common.songCount", { count: tracks.length })}</Text>
-        </div>
-        <Space className="library-page-actions">
+    <div className="page-shell">
+      <PageHeader
+        title={t("songs.title")}
+        meta={t("common.songCount", { count: tracks.length })}
+        actions={<>
           <Input
             allowClear
             className="page-search"
@@ -57,43 +60,37 @@ export const SongsPage = memo(function SongsPage({
             value={query}
             onChange={(event) => onChangeQuery(event.target.value)}
           />
-          <Tooltip title={t("songs.reloadHint")}>
-            <Button
-              aria-label={t("songs.reloadAria")}
-              icon={<ReloadOutlined />}
-              disabled={!selectedTrack}
-              loading={loading}
-              onClick={onReloadTrack}
-            />
-          </Tooltip>
-          {selectionMode ? (
-            <Button icon={<CloseOutlined />} onClick={() => onChangeSelectionMode(false)}>{t("selection.exit")}</Button>
-          ) : (
-            <Button icon={<CheckSquareOutlined />} onClick={() => onChangeSelectionMode(true)}>{t("selection.enter")}</Button>
-          )}
-        </Space>
-      </Flex>
+          <SortSelect
+            value={sort}
+            onChange={onSortChange}
+            fields={trackSortFields.map((key) => ({ key, label: t(`sort.field.${key}`) }))}
+          />
+          <LibraryRefreshButton disabled={!canRefreshLibrary || loading} onRefresh={onRefreshLibrary} />
+          {/* The empty state already offers this action; showing it twice on one screen is noise. */}
+          {empty && !searching ? null : addFolderAction}
+        </>}
+      />
 
-      <section className="library-list-section">
-        {selectionMode ? <LibrarySelectionToolbar selectedCount={selectedPaths.length} onOpenBatch={onOpenBatch} /> : null}
-        {tracks.length === 0 && !loading ? (
-          <Empty className="page-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description={t("songs.empty")} />
+      <div className="page-body">
+        {empty ? (
+          <EmptyState
+            description={searching ? t("songs.noResults") : t("songs.empty")}
+            action={searching
+              ? <Button onClick={() => onChangeQuery("")}>{t("songs.clearSearch")}</Button>
+              : addFolderAction}
+          />
         ) : (
           <LibraryTable
             tracks={tracks}
             loading={loading}
-            selectedPath={selectedPath}
             selectedPaths={selectedPaths}
-            onSelectTrack={onSelectTrack}
             onOpenTrack={handleOpenTrack}
             onChangeSelectedPaths={onChangeSelectedPaths}
-            selectionMode={selectionMode}
-            onChangeSelectionMode={onChangeSelectionMode}
-            onOpenBatch={onOpenBatch}
-            showSelectionToolbar={false}
+            sort={sort}
+            onSortChange={onSortChange}
           />
         )}
-      </section>
+      </div>
     </div>
   );
 });

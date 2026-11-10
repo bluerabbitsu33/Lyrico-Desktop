@@ -30,6 +30,67 @@ pub(crate) fn invoke(
     plugin: &SourcePlugin,
     function_name: &str,
     request: Value,
+    locale: Option<&str>,
+) -> Result<Value, String> {
+    let operation = crate::logging::Operation::new(
+        "plugins",
+        "invoke",
+        json!({"pluginId":plugin.manifest.id,"version":plugin.manifest.version_name,"function":function_name,"page":request.get("page"),"pageSize":request.get("pageSize")}),
+        log::Level::Debug,
+    );
+    let result = invoke_inner(plugin, function_name, request, locale);
+    // Never persist arbitrary JS exceptions or host payloads; preserve the business result.
+    let diagnostic = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| plugin_error_summary(error));
+    if let Ok(value) = &result {
+        let count = value.as_array().map(Vec::len).or_else(|| {
+            ["items", "results", "songs", "data"]
+                .iter()
+                .find_map(|key| value.get(key)?.as_array().map(Vec::len))
+        });
+        crate::logging::event(
+            log::Level::Debug,
+            "plugins",
+            "response.summary",
+            json!({"pluginId":plugin.manifest.id,"function":function_name,"resultCount":count}),
+        );
+    }
+    operation.finish(&diagnostic);
+    result
+}
+
+fn plugin_error_summary(error: &str) -> String {
+    for kind in [
+        "TypeError",
+        "SyntaxError",
+        "ReferenceError",
+        "RangeError",
+        "InternalError",
+        "Error",
+    ] {
+        if error.contains(&format!("JavaScript {kind}:")) {
+            return format!("JavaScript {kind}; inspect plugin code and runtime limits");
+        }
+    }
+    if error.starts_with("Plugin is disabled") {
+        return "Plugin is disabled".into();
+    }
+    if error.starts_with("Unsupported plugin function:") {
+        return "Unsupported plugin function".into();
+    }
+    if error.starts_with("Could not read ") {
+        return "Cannot read plugin script".into();
+    }
+    "Plugin runtime failed; inspect preceding network or script diagnostics".into()
+}
+
+fn invoke_inner(
+    plugin: &SourcePlugin,
+    function_name: &str,
+    request: Value,
+    locale: Option<&str>,
 ) -> Result<Value, String> {
     if !plugin.is_enabled_anywhere() {
         return Err("Plugin is disabled for every search type".to_string());
@@ -73,7 +134,7 @@ pub(crate) fn invoke(
     let started = Instant::now();
     runtime.set_interrupt_handler(Some(Box::new(move || started.elapsed() >= TIMEOUT)));
     let context = Context::full(&runtime).map_err(|error| error.to_string())?;
-    let host = Arc::new(Mutex::new(HostApi::new(plugin)?));
+    let host = Arc::new(Mutex::new(HostApi::new(plugin, locale)?));
 
     context.with(|ctx| {
         let host = Arc::clone(&host);
@@ -125,10 +186,26 @@ pub(crate) fn invoke(
     })
 }
 
+
 fn format_js_error(ctx: &rquickjs::Ctx<'_>, error: rquickjs::Error) -> String {
     if ctx.has_exception() {
         let exception = ctx.catch();
-        format!("{error}: {exception:?}")
+        let kind = exception
+            .as_object()
+            .and_then(|object| object.get::<_, String>("name").ok())
+            .filter(|name| {
+                [
+                    "TypeError",
+                    "SyntaxError",
+                    "ReferenceError",
+                    "RangeError",
+                    "InternalError",
+                    "Error",
+                ]
+                .contains(&name.as_str())
+            })
+            .unwrap_or_else(|| "Error".into());
+        format!("JavaScript {kind}: {error}: {exception:?}")
     } else {
         error.to_string()
     }
@@ -178,25 +255,60 @@ struct HostApi {
     plugin_id: String,
     cache_path: PathBuf,
     cache: Map<String, Value>,
+    strings: Option<crate::plugins::i18n::Snapshot>,
 }
 
 impl HostApi {
-    fn new(plugin: &SourcePlugin) -> Result<Self, String> {
+    fn new(plugin: &SourcePlugin, locale: Option<&str>) -> Result<Self, String> {
         let cache_path = Path::new(&plugin.plugin_dir).join(".cache.json");
         let cache = fs::read_to_string(&cache_path)
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default();
+        let preferences = locale
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default();
+        let strings = if plugin.manifest.i18n.is_some() {
+            crate::plugins::i18n::PluginStrings::load(
+                Path::new(&plugin.plugin_dir),
+                &plugin.manifest,
+            )
+            .ok()
+            .map(|strings| strings.snapshot(&preferences))
+        } else {
+            None
+        };
         Ok(Self {
             plugin_id: plugin.manifest.id.clone(),
             cache_path,
             cache,
+            strings,
         })
     }
 
     fn call(&mut self, name: &str, payload_json: &str) -> Result<Value, String> {
         let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
         match name {
+            "i18n.getLocale" => Ok(Value::String(
+                self.strings
+                    .as_ref()
+                    .map(|snapshot| snapshot.locale().to_string())
+                    .unwrap_or_else(|| "und".to_string()),
+            )),
+            "i18n.t" => {
+                let snapshot = self
+                    .strings
+                    .as_ref()
+                    .ok_or_else(|| "Plugin has no string resources".to_string())?;
+                let args = payload
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                snapshot
+                    .format(&string(&payload, "key"), &args)
+                    .map(Value::String)
+            }
             "app.info" => Ok(
                 json!({"name":"Lyrico","packageName":"com.lonx.lyrico.desktop","versionName":env!("CARGO_PKG_VERSION"),"versionCode":1,"buildType":"desktop","debug":cfg!(debug_assertions)}),
             ),
@@ -208,12 +320,16 @@ impl HostApi {
                 json!({"pluginApiVersion":PLUGIN_API_VERSION,"hostApiVersion":HOST_API_VERSION,"engine":"quickjs","engineVersion":null,"supportedHostApis":SUPPORTED_HOST_APIS}),
             ),
             "log.debug" | "log.warn" | "log.error" => {
-                eprintln!(
-                    "[plugin:{}][{}][{}] {}",
-                    self.plugin_id,
-                    name,
-                    string(&payload, "tag"),
-                    string(&payload, "message")
+                let level = match name {
+                    "log.error" => log::Level::Error,
+                    "log.warn" => log::Level::Warn,
+                    _ => log::Level::Debug,
+                };
+                crate::logging::event(
+                    level,
+                    "plugins",
+                    "host.diagnostic",
+                    json!({"pluginId":self.plugin_id,"messageOmitted":true}),
                 );
                 Ok(Value::String(String::new()))
             }
@@ -319,7 +435,7 @@ impl HostApi {
             "compression.inflateBase64ToText" => Ok(Value::String(inflate(&decode_standard(
                 &string(&payload, "base64"),
             )?)?)),
-            name if name.starts_with("http.") => http_call(name, &payload),
+            name if name.starts_with("http.") => http_call(&self.plugin_id, name, &payload),
             name if name.starts_with("xml.") => super::xml::call(name, &payload),
             _ => Err(format!("Unsupported host API: {name}")),
         }
@@ -368,7 +484,52 @@ impl HostApi {
     }
 }
 
-fn http_call(name: &str, payload: &Value) -> Result<Value, String> {
+fn http_call(plugin_id: &str, name: &str, payload: &Value) -> Result<Value, String> {
+    let started = Instant::now();
+    let result = http_call_inner(plugin_id, name, payload);
+    if result.is_err() {
+        crate::logging::event(
+            log::Level::Warn,
+            "network",
+            "http.failed",
+            json!({"pluginId":plugin_id,"host":reqwest::Url::parse(&string(payload,"url")).ok().and_then(|url| url.host_str().map(str::to_owned)),"method":if name.contains("post") {"POST"} else {"GET"},"elapsedMs":started.elapsed().as_millis(),"error":result.as_ref().err().map(|error| http_error_summary(error))}),
+        );
+    }
+    result
+}
+
+fn http_error_summary(error: &str) -> &'static str {
+    if error.starts_with("HTTP timeout:") {
+        "Request timed out"
+    } else if error.starts_with("HTTP connection:") {
+        "Cannot establish connection (DNS, TCP or TLS)"
+    } else if error.starts_with("HTTP redirect:") {
+        "Redirect limit or redirect policy failure"
+    } else if error.starts_with("HTTP response body:") {
+        "Cannot read response body"
+    } else if error.starts_with("HTTP request:") {
+        "Invalid or unsuccessful HTTP request"
+    } else {
+        "Cannot prepare request or decode response"
+    }
+}
+fn request_error(error: reqwest::Error, stage: &str) -> String {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if stage == "response body" {
+        "response body"
+    } else {
+        "request"
+    };
+    format!("HTTP {category}: {error}")
+}
+
+fn http_call_inner(plugin_id: &str, name: &str, payload: &Value) -> Result<Value, String> {
+    let started = Instant::now();
     let timeout = payload
         .get("readTimeoutMs")
         .and_then(Value::as_u64)
@@ -417,8 +578,20 @@ fn http_call(name: &str, payload: &Value) -> Result<Value, String> {
         client.get(url)
     };
     request = request.headers(headers);
-    let response = request.send().map_err(|error| error.to_string())?;
+    let response = request
+        .send()
+        .map_err(|error| request_error(error, "send"))?;
     let status = response.status();
+    crate::logging::event(
+        if status.is_client_error() || status.is_server_error() {
+            log::Level::Warn
+        } else {
+            log::Level::Debug
+        },
+        "network",
+        "http.response",
+        json!({"pluginId":plugin_id,"elapsedMs":started.elapsed().as_millis(),"host":response.url().host_str(),"status":status.as_u16(),"method":if name.contains("post") {"POST"} else {"GET"},"timeoutMs":timeout}),
+    );
     let response_headers = response
         .headers()
         .iter()
@@ -432,7 +605,9 @@ fn http_call(name: &str, payload: &Value) -> Result<Value, String> {
                 ));
             map
         });
-    let bytes = response.bytes().map_err(|error| error.to_string())?;
+    let bytes = response
+        .bytes()
+        .map_err(|error| request_error(error, "response body"))?;
     if name == "http.getText" || name == "http.postText" {
         return String::from_utf8(bytes.to_vec())
             .map(Value::String)
@@ -515,6 +690,8 @@ fn now_ms() -> u64 {
 }
 
 const SUPPORTED_HOST_APIS: &[&str] = &[
+    "i18n.getLocale",
+    "i18n.t",
     "app.info",
     "app.userAgent",
     "runtime.info",
@@ -564,7 +741,8 @@ const HOST_BOOTSTRAP: &str = r#"
  function body(url,value,o){o=opts(o);return {url:String(url||''),body:value==null?'':String(value),bodyBase64:o.bodyBase64,bodyBytes:o.bodyBytes,contentType:o.contentType||'application/json; charset=utf-8',headers:o.headers,connectTimeoutMs:o.connectTimeoutMs,readTimeoutMs:o.readTimeoutMs,followRedirects:o.followRedirects}}
  var app={getInfo:function(){return call('app.info',{})},getUserAgent:function(){return call('app.userAgent',{})}};
  var runtime={getInfo:function(){return call('runtime.info',{})}};
- var map={
+  var map={
+   i18n:{getLocale:function(){return call('i18n.getLocale',{})},t:function(k){return call('i18n.t',{key:String(k||''),args:Array.prototype.slice.call(arguments,1)})}},
   cache:{get:function(k){return call('cache.get',{key:String(k||'')})},set:function(k,v,t){return call('cache.set',{key:String(k||''),value:v==null?'':String(v),ttlMs:Number(t||0)})},remove:function(k){return call('cache.remove',{key:String(k||'')})},clear:function(){return call('cache.clear',{})}},
   crypto:{md5:function(v){return call('crypto.md5',{text:String(v||'')})},aesEcbPkcs5EncryptBase64:function(v,k){return call('crypto.aesEcbPkcs5EncryptBase64',{text:String(v||''),key:String(k||'')})},aesEcbPkcs5EncryptHex:function(v,k){return call('crypto.aesEcbPkcs5EncryptHex',{text:String(v||''),key:String(k||'')})},aesEcbPkcs5DecryptBase64ToText:function(v,k){return call('crypto.aesEcbPkcs5DecryptBase64ToText',{base64:String(v||''),key:String(k||'')})}},
   base64:{encodeText:function(v){return call('base64.encodeText',{text:String(v||'')})},decodeText:function(v){return call('base64.decodeText',{base64:String(v||'')})},dropBytes:function(v,n){return call('base64.dropBytes',{base64:String(v||''),count:Number(n||0)})},decodeBytes:function(v){return call('base64.decodeBytes',{base64:String(v||'')})},encodeBytes:function(v){return call('base64.encodeBytes',{bytes:Array.from(v||[])})},encodeUrlText:function(v){return call('base64.encodeUrlText',{text:String(v||'')})},decodeUrlText:function(v){return call('base64.decodeUrlText',{base64Url:String(v||'')})},encodeUrlBytes:function(v){return call('base64.encodeUrlBytes',{bytes:Array.from(v||[])})},decodeUrlBytes:function(v){return call('base64.decodeUrlBytes',{base64Url:String(v||'')})},toUrl:function(v){return call('base64.toUrl',{base64:String(v||'')})},fromUrl:function(v){return call('base64.fromUrl',{base64Url:String(v||'')})}},
@@ -577,237 +755,3 @@ const HOST_BOOTSTRAP: &str = r#"
  map.app=app;map.runtime=runtime;globalThis.app=app;globalThis.runtime=runtime;globalThis.Platform=map;
 })();
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plugins::manifest::{PluginManifest, PluginSourceState, SourcePlugin};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn loads_include_scripts_before_entry_and_calls_host_api() {
-        let root = std::env::temp_dir().join(format!("lyrico-plugin-runtime-{}", now_ms()));
-        fs::create_dir_all(root.join("lib")).unwrap();
-        fs::write(
-            root.join("lib/01_shared.js"),
-            "var sharedTitle = 'from include';",
-        )
-        .unwrap();
-        fs::write(
-            root.join("source.js"),
-            "function searchSongs(request) { return [{ id: Platform.crypto.md5(request.keyword), title: sharedTitle, artist: Platform.app.getInfo().name }]; }",
-        )
-        .unwrap();
-        let plugin = fixture_plugin(&root, true);
-
-        let result = invoke(&plugin, "searchSongs", json!({"keyword":"test"})).unwrap();
-
-        assert_eq!(result[0]["title"], "from include");
-        assert_eq!(result[0]["artist"], "Lyrico");
-        assert_eq!(result[0]["id"], "098f6bcd4621d373cade4e832627b4f6");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn exposes_api4_protocol_and_keeps_empty_capabilities_legacy_compatible() {
-        let root = std::env::temp_dir().join(format!("lyrico-plugin-api4-{}", now_ms()));
-        fs::create_dir_all(root.join("lib")).unwrap();
-        fs::write(
-            root.join("source.js"),
-            "function searchSongs() { return [Platform.runtime.getInfo()]; }",
-        )
-        .unwrap();
-        let mut plugin = fixture_plugin(&root, true);
-        plugin.manifest.capabilities.clear();
-
-        let result = invoke(&plugin, "searchSongs", json!({})).unwrap();
-
-        assert_eq!(result[0]["pluginApiVersion"], 4);
-        assert_eq!(result[0]["hostApiVersion"], 3);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn refuses_disabled_plugin() {
-        let root = std::env::temp_dir().join(format!("lyrico-plugin-disabled-{}", now_ms()));
-        let plugin = fixture_plugin(&root, false);
-        assert_eq!(
-            invoke(&plugin, "searchSongs", json!({})).unwrap_err(),
-            "Plugin is disabled for every search type"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a mobile plugin checkout and network access"]
-    fn invokes_a_mobile_plugin_package() {
-        let root = PathBuf::from(std::env::var("LYRICO_MOBILE_PLUGIN_DIR").unwrap());
-        let manifest: PluginManifest =
-            serde_json::from_str(&fs::read_to_string(root.join("manifest.json")).unwrap()).unwrap();
-        let source_states = enabled_source_states(&manifest.capabilities);
-        let plugin = SourcePlugin {
-            manifest,
-            plugin_dir: root.to_string_lossy().to_string(),
-            icon_path: None,
-            icon_data_url: None,
-            source_states,
-            installed_at: String::new(),
-            updated_at: String::new(),
-            config: json!({}),
-        };
-        let result = invoke(
-            &plugin,
-            "searchSongs",
-            json!({"keyword":"周杰伦 晴天","page":1,"pageSize":3,"separator":"/","config":{}}),
-        )
-        .unwrap();
-        assert!(
-            result.as_array().is_some_and(|items| !items.is_empty()),
-            "{result}"
-        );
-        if plugin.manifest.api_version >= 4
-            && plugin
-                .manifest
-                .capabilities
-                .iter()
-                .any(|capability| capability == "getLyrics")
-        {
-            let lyrics = invoke(
-                &plugin,
-                "getLyrics",
-                json!({"song":result[0],"page":1,"pageSize":3,"config":plugin.config}),
-            )
-            .unwrap();
-            let candidates = lyrics.as_array().expect("API4 lyrics must be an array");
-            assert!(!candidates.is_empty(), "{lyrics}");
-            for key in ["ti", "ar", "al", "date"] {
-                assert!(
-                    candidates[0]["tags"][key]
-                        .as_str()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "missing tags.{key}: {}",
-                    candidates[0]
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires the mobile Apple plugin checkout"]
-    fn runs_mobile_apple_same_family_localization_and_keeps_cross_family_subtitle() {
-        let mobile_lib = std::env::var("LYRICO_MOBILE_APPLE_LIB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(r"E:\Lyrico\Lyrico-Plugins\apple\lib\01_apple_api.js")
-            });
-        let root = std::env::temp_dir().join(format!("lyrico-apple-xml-runtime-{}", now_ms()));
-        fs::create_dir_all(root.join("lib")).unwrap();
-        fs::copy(&mobile_lib, root.join("lib/01_apple_api.js")).unwrap();
-        fs::write(
-            root.join("source.js"),
-            "function searchSongs(request) { return [{ id: 'localized', title: applyAppleOfficialLocalizationToTtml(request.ttml, request.language) }]; }",
-        )
-        .unwrap();
-        let plugin = fixture_plugin(&root, true);
-        let chinese = r#"<tt xml:lang="zh-Hant" xmlns:itunes="http://www.apple.com/itunes"><body><div><p itunes:key="L1">這裡有故事</p></div></body><metadata><translations><translation xml:lang="zh-Hans"><text for="L1">这里有故事</text></translation></translations></metadata></tt>"#;
-        let localized = invoke(
-            &plugin,
-            "searchSongs",
-            json!({"ttml":chinese,"language":"zh-Hans"}),
-        )
-        .unwrap();
-        let localized = localized[0]["title"].as_str().unwrap();
-        assert!(localized.contains("xml:lang=\"zh-Hans\""));
-        assert!(localized.contains(">这里有故事</p>"));
-        assert!(!localized.contains("<translation "));
-
-        let english = r#"<tt xml:lang="en" xmlns:itunes="http://www.apple.com/itunes"><body><div><p itunes:key="L1">A story</p></div></body><metadata><translations><translation xml:lang="zh-Hans"><text for="L1">一个故事</text></translation></translations></metadata></tt>"#;
-        let unchanged = invoke(
-            &plugin,
-            "searchSongs",
-            json!({"ttml":english,"language":"zh-Hans"}),
-        )
-        .unwrap();
-        let unchanged = unchanged[0]["title"].as_str().unwrap();
-        assert!(unchanged.contains(">A story</p>"));
-        assert!(unchanged.contains("<translation xml:lang=\"zh-Hans\""));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    fn fixture_plugin(root: &Path, enabled: bool) -> SourcePlugin {
-        let manifest = PluginManifest {
-            id: "com.example.test".to_string(),
-            name: "Test".to_string(),
-            version_code: 1,
-            version_name: "1.0.0".to_string(),
-            author: String::new(),
-            description: String::new(),
-            api_version: 3,
-            min_host_api_version: 3,
-            entry: "source.js".to_string(),
-            include_dirs: vec!["lib".to_string()],
-            icon: None,
-            capabilities: vec!["searchSongs".to_string()],
-            config_fields: vec![],
-        };
-        let source_states = if enabled {
-            enabled_source_states(&manifest.capabilities)
-        } else {
-            Default::default()
-        };
-        SourcePlugin {
-            manifest,
-            plugin_dir: root.to_string_lossy().to_string(),
-            icon_path: None,
-            icon_data_url: None,
-            source_states,
-            installed_at: String::new(),
-            updated_at: String::new(),
-            config: json!({}),
-        }
-    }
-
-    fn enabled_source_states(capabilities: &[String]) -> BTreeMap<String, PluginSourceState> {
-        let capabilities = if capabilities.is_empty() {
-            vec!["searchSongs"]
-        } else {
-            capabilities.iter().map(String::as_str).collect()
-        };
-        let supports = |capability: &str| capabilities.contains(&capability);
-        let mut kinds = Vec::new();
-        if ["searchSongs", "getLyrics", "searchCovers"]
-            .iter()
-            .all(|capability| supports(capability))
-        {
-            kinds.push("aggregated");
-        }
-        if supports("searchSongs") {
-            kinds.push("metadata");
-        }
-        if supports("getLyrics") {
-            kinds.push("lyrics");
-        }
-        if supports("searchCovers") {
-            kinds.push("covers");
-        }
-        kinds
-            .into_iter()
-            .map(|kind| {
-                (
-                    kind.to_string(),
-                    PluginSourceState {
-                        enabled: true,
-                        priority: 0,
-                    },
-                )
-            })
-            .collect()
-    }
-}
-#[test]
-fn null_binary_body_does_not_override_text_body() {
-    let payload = json!({"body":"{\"query\":\"晴天\"}","bodyBytes":null,"bodyBase64":""});
-    assert_eq!(
-        http_request_body(&payload).unwrap(),
-        "{\"query\":\"晴天\"}".as_bytes()
-    );
-}

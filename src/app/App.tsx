@@ -1,15 +1,18 @@
-import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { App as AntApp, ConfigProvider, Form, Spin, theme } from "antd";
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { App as AntApp, Button, ConfigProvider, Form, Spin, theme } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
-import { lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   loadLibraryFolders,
   loadArtistSplitConfig,
   loadLibraryTrack,
+  loadCustomTags,
   loadLibraryTracks,
+  loadLibraryTracksByPaths,
   loadBatchTaskItems,
   readAudioFile,
   readImageFile,
@@ -27,15 +30,21 @@ import {
   loadSourcePlugins,
   loadDesktopSettings,
   installSourcePluginArchive,
-  previewSourcePluginArchive,
   saveSourcePluginSettings,
   saveDesktopSettings,
   setPluginSourceEnabled,
   reorderPluginSources,
+  searchLyricsLines,
+  pickPaths,
+  pickSavePath,
   uninstallSourcePlugin,
+  setTrayLabels,
 } from "../backend/audioApi";
+import { useBlockMouseSideButtons } from "../hooks/useGoUpOnMouseBack";
+import { CloseBehaviorDialog } from "../components/CloseBehaviorDialog";
+import { AppErrorBoundary } from "../components/AppErrorBoundary";
+import { reportFrontendError } from "../backend/diagnostics";
 import { Shell } from "../components/Shell";
-import { TitleBar } from "../components/TitleBar";
 import { AppContextMenu } from "../components/AppContextMenu";
 import { SongDetails } from "../components/SongDetails";
 import { AlbumsPage } from "../pages/AlbumsPage";
@@ -43,84 +52,168 @@ import { ArtistsPage } from "../pages/ArtistsPage";
 import { FoldersPage } from "../pages/FoldersPage";
 import { SongsPage } from "../pages/SongsPage";
 import { defaultArtistSplitConfig, filterTracks, groupAlbums, groupArtists } from "../domain/library";
+import { albumSortFields, artistSortFields, folderSortFields, trackSortFields, type AlbumSortField, type ArtistSortField, type FolderSortField, type SortState, type TrackSortField } from "../domain/sort";
 import { completeTagForm, splitGenreValues } from "../domain/tagForm";
+import { filterHiddenCustomTagEdits } from "../domain/editFieldSettings";
 import { detectLyricsFormat } from "../backend/lyricsApi";
-import { updateCachedCover } from "../hooks/useTrackCovers";
+import { invalidateCachedCovers, updateCachedCover } from "../hooks/useTrackCovers";
+import { invalidateArtistPosters } from "../hooks/useArtistPoster";
+import { applyBatchLibraryUpdate, applyLibraryTrackUpdate, libraryPathsToRefresh, type LibraryTrackUpdate } from "../domain/libraryRefresh";
 import {
   getLanguagePreference,
   resolveLanguage,
   setLanguagePreference as persistLanguagePreference,
   type LanguagePreference,
 } from "../i18n";
-import type { ArtistSplitConfig, AudioTrack, BatchTask, BatchTaskItem, DesktopSettings, LibraryFolder, PluginInstallDraft, PluginSourceKind, ScanProgress, SourcePlugin, TagForm, ViewKey } from "./types";
+import type { ArtistSplitConfig, AudioTrack, BatchTask, BatchTaskItem, CustomTag, DesktopSettings, LibraryFolder, LibrarySort, LibrarySortPage, ScanProgress, PluginSourceKind, SourcePlugin, TagForm, ViewKey } from "./types";
 
 const PluginsPage = lazy(() => import("../pages/PluginsPage").then((m) => ({ default: m.PluginsPage })));
 const SettingsPage = lazy(() => import("../pages/SettingsPage").then((m) => ({ default: m.SettingsPage })));
 const TasksPage = lazy(() => import("../pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 import { getReplayGainProgress, publishReplayGainProgress } from "../hooks/useReplayGainProgress";
+import { getThemeMode, prefersDark, setThemeMode, subscribeTheme } from "./theme";
+import type { ThemeMode } from "../backend/audioApi";
+import { isPathInHiddenFolder } from "../domain/libraryVisibility";
+import { deduplicateFolders, folderPathKey, upsertFolder } from "../domain/libraryFolders";
+import { shareFile } from "@sosweetham/tauri-plugin-sharehub-api";
+import { fileUrlForShare } from "../domain/share";
 import "../App.css";
+import { reorderPluginState } from "../data/pluginSources";
 
 const defaultDesktopSettings: DesktopSettings = {
   searchPageSize: 10,
   replayGainTargetLoudness: -18,
+  replayGainPeakMode: "samplePeak",
   lyricFormat: "verbatimLrc",
   lyricsConversionMode: "none",
   showTranslation: true,
   showRomanization: true,
   onlyTranslationIfAvailable: false,
   removeEmptyLyricLines: true,
+  lyricLineOrder: ["original", "romanization", "translation"],
+  removeTagLineKeywords: [],
+  ignoreShortAudio: false,
+  lyricIndexEnabled: true,
+  hiddenFolderPaths: [],
+  artistPosterFolder: "",
+  themeMode: "system",
+  editFieldVisibility: {},
+  editCustomTags: [],
+  editFieldOrder: ["basic", "track", "credits", "customTags", "replaygain", "lyrics", "cover"],
+  librarySorts: {},
+  batchOperation: "replaygain",
+  closeToTray: false,
+  closeToTrayPrompted: false,
   renameCharacterMappings: {
     "\\": "＼", "/": "／", ":": "：", "*": "＊", "?": "？", "\"": "＂", "<": "＜", ">": "＞", "|": "｜",
   },
-  theme: "system",
 };
+
+const desktopSettingsArrayFields = ["lyricLineOrder", "removeTagLineKeywords", "hiddenFolderPaths", "editFieldOrder", "editCustomTags"] as const;
+const desktopSettingsRecordFields = ["renameCharacterMappings", "editFieldVisibility", "librarySorts"] as const;
+
+const librarySortPageFields: Record<LibrarySortPage, ReadonlySet<string>> = {
+  songs: new Set(trackSortFields),
+  albums: new Set(albumSortFields),
+  artists: new Set(artistSortFields),
+  folders: new Set(folderSortFields),
+};
+
+/**
+ * Settings written by an older build can miss fields. Merge what was stored onto the
+ * defaults so every `desktopSettings.*` read downstream stays safe; saved values still
+ * take precedence over the defaults.
+ */
+function normalizeDesktopSettings(stored: unknown): DesktopSettings {
+  const merged: Record<string, unknown> = { ...defaultDesktopSettings };
+  if (stored && typeof stored === "object") {
+    for (const [key, value] of Object.entries(stored)) {
+      if (value !== undefined && value !== null) merged[key] = value;
+    }
+  }
+  for (const key of desktopSettingsArrayFields) {
+    if (!Array.isArray(merged[key])) merged[key] = [...(defaultDesktopSettings[key] as readonly unknown[])];
+  }
+  for (const key of desktopSettingsRecordFields) {
+    const value = merged[key];
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      merged[key] = { ...(defaultDesktopSettings[key] as Record<string, unknown>) };
+    } else {
+      merged[key] = { ...value };
+    }
+  }
+  if (typeof merged.artistPosterFolder !== "string") merged.artistPosterFolder = defaultDesktopSettings.artistPosterFolder;
+  if (typeof merged.batchOperation !== "string") merged.batchOperation = defaultDesktopSettings.batchOperation;
+  const storedSorts = merged.librarySorts as Record<string, unknown>;
+  for (const [page, entry] of Object.entries(storedSorts)) {
+    const allowed = librarySortPageFields[page as LibrarySortPage];
+    const candidate = entry as { key?: unknown; direction?: unknown } | null | undefined;
+    if (
+      !allowed
+      || !candidate
+      || typeof candidate.key !== "string"
+      || !allowed.has(candidate.key)
+      || (candidate.direction !== "asc" && candidate.direction !== "desc")
+    ) {
+      delete storedSorts[page];
+    }
+  }
+  return merged as unknown as DesktopSettings;
+}
 
 export default function App() {
   const { i18n } = useTranslation();
   const antLocale = i18n.resolvedLanguage?.startsWith("zh") ? zhCN : enUS;
-  const [themePreference, setThemePreference] = useState<DesktopSettings["theme"]>("system");
+  const [themeMode, setThemeModeState] = useState<ThemeMode>(getThemeMode);
+  const [systemDark, setSystemDark] = useState(prefersDark);
+
+  useEffect(() => subscribeTheme(setThemeModeState), []);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleChange = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    media.addEventListener("change", handleChange);
+    return () => media.removeEventListener("change", handleChange);
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = i18n.resolvedLanguage ?? "en-US";
   }, [i18n.resolvedLanguage]);
 
-  const resolvedTheme = useMemo(() => {
-    if (themePreference === "system") {
-      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    }
-    return themePreference;
-  }, [themePreference]);
+  const darkTheme = themeMode === "dark" || (themeMode === "system" && systemDark);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", resolvedTheme);
-  }, [resolvedTheme]);
+    document.documentElement.dataset.theme = darkTheme ? "dark" : "light";
+  }, [darkTheme]);
 
   useEffect(() => {
-    if (themePreference !== "system") return;
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = () => {
-      document.documentElement.setAttribute("data-theme", mediaQuery.matches ? "dark" : "light");
-    };
-    mediaQuery.addEventListener("change", handler);
-    return () => mediaQuery.removeEventListener("change", handler);
-  }, [themePreference]);
+    if (!isTauri()) return;
+    void getCurrentWindow().setTheme(themeMode === "system" ? null : themeMode)
+      .catch(error => reportFrontendError("error", error, "window.setTheme"));
+  }, [themeMode]);
 
   return (
     <ConfigProvider
       locale={antLocale}
       theme={{
         cssVar: {},
-        algorithm: resolvedTheme === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm,
+        algorithm: darkTheme ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {
           colorPrimary: "#1677ff",
-          borderRadius: 8,
+          borderRadius: 4,
+          controlHeight: 30,
+          fontSize: 13,
           fontFamily:
             "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
         },
       }}
     >
-      <AntApp>
-        <LyricoDesktop onThemeChange={setThemePreference} />
+      <AntApp message={{ top: 12, maxCount: 3 }} notification={{ placement: "bottomRight", bottom: 40, maxCount: 3 }}>
+        {/* Outer boundary: a crash in LyricoDesktop itself must not blank the window. */}
+        <AppErrorBoundary>
+          <LyricoDesktop />
+        </AppErrorBoundary>
       </AntApp>
     </ConfigProvider>
   );
@@ -145,15 +238,18 @@ function PageViewport({ scrollKey, hidden, children }: { scrollKey: string; hidd
   return <div ref={viewportRef} className={`page-viewport${hidden ? " is-hidden" : ""}`} aria-hidden={hidden}>{children}</div>;
 }
 
-function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettings["theme"]) => void }) {
-  const { message } = AntApp.useApp();
+function LyricoDesktop() {
+  const { message, notification } = AntApp.useApp();
+  const notifiedTasks = useRef(new Set<string>());
+  const pluginMutationInFlight = useRef(false);
+  const [pluginMutationBusy, setPluginMutationBusy] = useState(false);
   const { t, i18n } = useTranslation();
+  useBlockMouseSideButtons();
   const [activeView, setActiveView] = useState<ViewKey>("songs");
   const [tracks, setTracks] = useState<AudioTrack[]>([]);
   const [folders, setFolders] = useState<LibraryFolder[]>([]);
   const [selectedPath, setSelectedPath] = useState<string>();
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [selectionMode, setSelectionMode] = useState(false);
   const [selectedFolderPath, setSelectedFolderPath] = useState<string>();
   const [selectedAlbumId, setSelectedAlbumId] = useState<string>();
   const [selectedArtistId, setSelectedArtistId] = useState<string>();
@@ -162,25 +258,73 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   const [saving, setSaving] = useState(false);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailTrack, setDetailTrack] = useState<AudioTrack>();
+  const [detailCustomTags, setDetailCustomTags] = useState<CustomTag[]>([]);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [detailsMounted, setDetailsMounted] = useState(false);
   const [albumDetailsOpen, setAlbumDetailsOpen] = useState(false);
   const [artistDetailsOpen, setArtistDetailsOpen] = useState(false);
   const [plugins, setPlugins] = useState<SourcePlugin[]>([]);
   const [artistSplitConfig, setArtistSplitConfig] = useState<ArtistSplitConfig>(defaultArtistSplitConfig);
   const [desktopSettings, setDesktopSettings] = useState<DesktopSettings>(defaultDesktopSettings);
+  const desktopSettingsRef = useRef(desktopSettings);
+  const settingsLoad = useRef<Promise<void>>(Promise.resolve());
+  desktopSettingsRef.current = desktopSettings;
+  const [closePromptOpen, setClosePromptOpen] = useState(false);
   const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(getLanguagePreference);
   const [scanProgress, setScanProgress] = useState<ScanProgress>();
   const [form] = Form.useForm<TagForm>();
   const detailRequest = useRef(0);
+  const activeFolderScans = useRef(new Set<string>());
+  const staleDetailPaths = useRef(new Set<string>());
+  const folderScanQueue = useRef<Promise<void>>(Promise.resolve());
+  const editingPathRef = useRef<string | undefined>(undefined);
   const artistSplitSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const settingsSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => {
+    editingPathRef.current = detailTrack?.path;
+  }, [detailTrack]);
+  // 托盘右键菜单文案跟随界面语言
+  useEffect(() => {
+    if (!isTauri()) return;
+    void setTrayLabels(t("common.openMainWindow"), t("common.quit"))
+      .catch(error => reportFrontendError("error", error, "tray.setLabels"));
+  }, [t, i18n.resolvedLanguage]);
+  // 首次关闭主窗口时询问最小化到托盘还是直接关闭
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+    void listen("close-tray-prompt", () => {
+      if (!disposed) setClosePromptOpen(true);
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    }).catch(error => reportFrontendError("error", error, "close.trayPrompt.listen"));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
   const deferredQuery = useDeferredValue(query);
-  const filteredTracks = useMemo(
-    () => filterTracks(tracks, deferredQuery),
-    [tracks, deferredQuery],
+  const isSearchView = activeView === "songs" || activeView === "albums" || activeView === "artists";
+  const [lyricMatchPaths, setLyricMatchPaths] = useState<Set<string>>(() => new Set());
+  const filteredTracks = useMemo(() => {
+    if (!isSearchView) return tracks;
+    const visibleTracks = tracks.filter((track) => !isPathInHiddenFolder(track.path, desktopSettings.hiddenFolderPaths ?? []));
+    const matched = filterTracks(visibleTracks, deferredQuery);
+    if (lyricMatchPaths.size === 0) return matched;
+    const matchedPaths = new Set(matched.map((track) => track.path));
+    const lyricExtras = visibleTracks.filter(
+      (track) => lyricMatchPaths.has(track.path) && !matchedPaths.has(track.path),
+    );
+    return lyricExtras.length ? [...matched, ...lyricExtras] : matched;
+  }, [tracks, deferredQuery, isSearchView, lyricMatchPaths, desktopSettings.hiddenFolderPaths]);
+  const albums = useMemo(() => (activeView === "albums" ? groupAlbums(filteredTracks) : []), [activeView, filteredTracks]);
+  const artists = useMemo(
+    () => (activeView === "artists" ? groupArtists(filteredTracks, artistSplitConfig) : []),
+    [activeView, filteredTracks, artistSplitConfig],
   );
-  const [albums, setAlbums] = useState<ReturnType<typeof groupAlbums>>([]);
-  const [artists, setArtists] = useState<ReturnType<typeof groupArtists>>([]);
+  useEffect(() => { invalidateArtistPosters(); }, [tracks, desktopSettings.artistPosterFolder]);
   const trackByPath = useMemo(() => {
     const map = new Map<string, AudioTrack>();
     for (const track of tracks) map.set(track.path, track);
@@ -196,23 +340,6 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   }, [selectedPaths, trackByPath]);
 
   useEffect(() => {
-    let cancelled = false;
-    const albumTimer = globalThis.setTimeout(() => {
-      const nextAlbums = groupAlbums(filteredTracks);
-      if (!cancelled) startTransition(() => setAlbums(nextAlbums));
-    }, 0);
-    const artistTimer = globalThis.setTimeout(() => {
-      const nextArtists = groupArtists(filteredTracks, artistSplitConfig);
-      if (!cancelled) startTransition(() => setArtists(nextArtists));
-    }, 16);
-    return () => {
-      cancelled = true;
-      globalThis.clearTimeout(albumTimer);
-      globalThis.clearTimeout(artistTimer);
-    };
-  }, [artistSplitConfig, filteredTracks]);
-
-  useEffect(() => {
     const timer = globalThis.setTimeout(() => {
       void Promise.all([import("../pages/PluginsPage"), import("../pages/SettingsPage"), import("../pages/TasksPage")]);
     }, 250);
@@ -220,43 +347,125 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   }, []);
 
   useEffect(() => {
-    Promise.all([loadLibraryFolders(), loadLibraryTracks(), loadArtistSplitConfig(), loadSourcePlugins(), loadDesktopSettings()])
-      .then(([storedFolders, storedTracks, storedArtistSplitConfig, storedPlugins, storedSettings]) => {
-        setFolders(storedFolders);
+    setThemeMode(desktopSettings.themeMode ?? "system");
+  }, [desktopSettings.themeMode]);
+
+  useEffect(() => {
+    const normalizedQuery = deferredQuery.trim();
+    if (!isSearchView || !normalizedQuery || !desktopSettings.lyricIndexEnabled) {
+      setLyricMatchPaths(new Set());
+      return;
+    }
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      searchLyricsLines(normalizedQuery, 100)
+        .then((matches) => {
+          if (disposed) return;
+          setLyricMatchPaths(new Set(matches.map((match) => match.path)));
+        })
+        .catch(() => {
+          if (!disposed) setLyricMatchPaths(new Set());
+        });
+    }, 250);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [deferredQuery, isSearchView, desktopSettings.lyricIndexEnabled]);
+
+  useEffect(() => {
+    settingsLoad.current = loadDesktopSettings().then(stored => {
+      const next = normalizeDesktopSettings(stored);
+      desktopSettingsRef.current = next;
+      setDesktopSettings(next);
+    });
+    void settingsLoad.current.catch(error => reportFrontendError("error", error, "settings.load"));
+    Promise.all([loadLibraryFolders(), loadLibraryTracks(), loadArtistSplitConfig(), loadSourcePlugins()])
+      .then(([storedFolders, storedTracks, storedArtistSplitConfig, storedPlugins]) => {
+        setFolders(deduplicateFolders(storedFolders));
         setTracks(storedTracks);
         setSelectedFolderPath(storedFolders[0]?.path);
         setSelectedPath(storedTracks[0]?.path);
         setSelectedPaths([]);
         setArtistSplitConfig(storedArtistSplitConfig);
         setPlugins(storedPlugins);
-        setDesktopSettings(storedSettings);
-        onThemeChange(storedSettings.theme);
       })
       .catch(() => {
         setFolders([]);
         setTracks([]);
         setPlugins([]);
-        setDesktopSettings(defaultDesktopSettings);
       });
   }, []);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: UnlistenFn | undefined;
+    void listen<LibraryTrackUpdate>("library-track-updated", ({ payload }) => {
+      if (disposed) return;
+      staleDetailPaths.current.add(normalizePath(payload.previousPath));
+      invalidateCachedCovers([payload.previousPath, ...(payload.track ? [payload.track.path] : [])]);
+      setTracks((current) => applyLibraryTrackUpdate(current, payload));
+      const nextPath = payload.track?.path;
+      setSelectedPath((current) => current && samePath(current, payload.previousPath) ? nextPath : current);
+      setSelectedPaths((current) => current.flatMap((path) => samePath(path, payload.previousPath) ? nextPath ? [nextPath] : [] : [path]));
+      // A batch update must not replace an editor draft; reopening reads the saved file.
+      if (!nextPath || !samePath(nextPath, payload.previousPath)) {
+        setDetailTrack((current) => current && samePath(current.path, payload.previousPath) ? undefined : current);
+      }
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    }).catch((error) => reportFrontendError("error", error, "library.listen"));
+    return () => { disposed = true; unlisten?.(); };
+  }, [setSelectedPaths]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+    const finished = notifiedTasks.current;
     void listen<BatchTask>("batch-task-updated", ({ payload }) => {
       if (!disposed && ["succeeded", "failed", "cancelled"].includes(payload.status)) {
-        void Promise.all([
-          loadLibraryTracks(),
-          payload.taskType === "renameFiles" ? loadBatchTaskItems(payload.taskId) : Promise.resolve([]),
-        ]).then(([nextTracks, items]) => {
+        const key = `${payload.taskId}:${payload.finishedAt ?? payload.updatedAt}`;
+        if (!finished.has(key)) {
+          finished.add(key);
+          const hasErrors = payload.status === "failed" || payload.failureCount > 0;
+          notification.open({
+            key: `batch:${payload.taskId}`,
+            type: hasErrors ? "warning" : payload.status === "cancelled" ? "info" : "success",
+            title: t(`feedback.batch.${payload.status}`),
+            description: <><div>{t("tasks.taskSummary", { current: payload.current, total: payload.total, success: payload.successCount, skipped: payload.skippedCount, failed: payload.failureCount })}</div>{payload.errorMessage && <div>{payload.errorMessage}</div>}</>,
+            duration: hasErrors ? 0 : 6,
+            actions: <Button size="small" onClick={() => { setActiveView("tasks"); notification.destroy(`batch:${payload.taskId}`); }}>{t("feedback.viewTasks")}</Button>,
+          });
+        }
+        void loadBatchTaskItems(payload.taskId).then(async (items) => {
+          const refreshPaths = libraryPathsToRefresh(payload.taskType, items);
+          const refreshed = refreshPaths.length ? await loadLibraryTracksByPaths(refreshPaths) : [];
           if (disposed) return;
-          setTracks(nextTracks);
+          for (const path of refreshPaths) staleDetailPaths.current.add(normalizePath(path));
+          if (payload.taskType !== "exportLyrics" && payload.taskType !== "exportCover") {
+            invalidateCachedCovers([
+              ...items.filter((item) => item.status === "succeeded").map((item) => item.songPath),
+              ...refreshPaths,
+            ]);
+          }
+          setTracks((current) => applyBatchLibraryUpdate(current, payload.taskType, items, refreshed));
           const renamedPaths = renamePathMap(items);
+          if (payload.taskType === "deleteFiles") {
+            const deletedPaths = new Set(
+              items
+                .filter((item) => item.status === "succeeded")
+                .map((item) => normalizePath(item.songPath)),
+            );
+            setSelectedPath((current) => current && deletedPaths.has(normalizePath(current)) ? undefined : current);
+            setSelectedPaths((current) => current.filter((path) => !deletedPaths.has(normalizePath(path))));
+            setDetailTrack((current) => current && deletedPaths.has(normalizePath(current.path)) ? undefined : current);
+          }
           if (renamedPaths.size === 0) return;
           setSelectedPath((current) => current ? renamedPaths.get(normalizePath(current)) ?? current : current);
           setSelectedPaths((current) => current.map((path) => renamedPaths.get(normalizePath(path)) ?? path));
           setDetailTrack((current) => current && renamedPaths.has(normalizePath(current.path)) ? undefined : current);
-        }).catch(() => undefined);
+        }).catch((error) => reportFrontendError("error", error, "library.batchRefresh"));
       }
     }).then((dispose) => {
       if (disposed) dispose();
@@ -266,7 +475,7 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [notification, t]);
 
   useEffect(() => {
     let disposed = false;
@@ -325,58 +534,92 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       replayGainReferenceLoudness: selectedTrack.replayGainReferenceLoudness,
       coverDataUrl: undefined,
       removeCover: false,
+      customTags: detailCustomTags,
     });
-  }, [form, selectedTrack]);
+  }, [detailCustomTags, form, selectedTrack]);
 
   async function addFolders() {
-    const selected = await open({ directory: true, multiple: true, title: t("folders.add") });
-    const selectedPaths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
-    const newPaths = selectedPaths.filter((path) => !folders.some((folder) => samePath(folder.path, path)));
+    const selectedPaths = await pickPaths({ directory: true, multiple: true, title: t("folders.add") });
+    const seen = new Set(folders.map((folder) => folderPathKey(folder.path)));
+    const newPaths = selectedPaths.filter((path) => {
+      const key = folderPathKey(path);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     if (newPaths.length === 0) return;
     for (const path of newPaths) await scanAndMergeFolder(path);
   }
 
-  async function scanAndMergeFolder(path: string) {
-    setLoading(true);
-    setFolders((current) => upsertFolder(current, { path, trackCount: 0, status: "scanning" }));
-    try {
-      const folderTracks = await scanFolder(path);
-      const scannedAt = new Date().toISOString();
-      setTracks((current) => mergeFolderTracks(current, folderTracks, path));
-      setFolders((current) =>
-        upsertFolder(current, { path, trackCount: folderTracks.length, status: "ready", lastScannedAt: scannedAt }),
-      );
-      setSelectedFolderPath(path);
-      setSelectedPath((current) => current ?? folderTracks[0]?.path);
-      message.success(t("messages.scanned", { count: folderTracks.length }));
-    } catch (error) {
-      const failedFolder = { path, trackCount: 0, status: "error" as const, error: String(error) };
-      setFolders((current) => upsertFolder(current, failedFolder));
-      await upsertLibraryFolder(failedFolder).catch(() => undefined);
-      message.error(String(error));
-    } finally {
-      setLoading(false);
-    }
+  async function refreshLibrary() {
+    if (activeFolderScans.current.size > 0) return;
+    for (const folder of deduplicateFolders(folders)) await scanAndMergeFolder(folder.path, false);
+  }
+
+  async function scanAndMergeFolder(path: string, selectFolder = true) {
+    const scanKey = folderPathKey(path);
+    if (activeFolderScans.current.has(scanKey)) return;
+    activeFolderScans.current.add(scanKey);
+    // The shell has one scan-progress surface, so all entry points share one queue.
+    const scan = folderScanQueue.current.then(async () => {
+      setLoading(true);
+      setFolders((current) => upsertFolder(current, { path, trackCount: 0, status: "scanning" }));
+      try {
+        const folderTracks = await scanFolder(path);
+        const scannedAt = new Date().toISOString();
+        for (const track of folderTracks) staleDetailPaths.current.add(normalizePath(track.path));
+        invalidateCachedCovers(folderTracks.map((track) => track.path));
+        setTracks((current) => mergeFolderTracks(current, folderTracks, path));
+        setFolders((current) =>
+          upsertFolder(current, { path, trackCount: folderTracks.length, status: "ready", lastScannedAt: scannedAt }),
+        );
+        if (selectFolder) setSelectedFolderPath(path);
+        setSelectedPath((current) => current ?? folderTracks[0]?.path);
+        notification.success({ title: t("scanProgress.phase.completed"), description: t("messages.scanned", { count: folderTracks.length }) });
+      } catch (error) {
+        const failedFolder = { path, trackCount: 0, status: "error" as const, error: String(error) };
+        setFolders((current) => upsertFolder(current, failedFolder));
+        await upsertLibraryFolder(failedFolder).catch(() => undefined);
+        notification.error({ title: t("scanProgress.phase.failed"), description: String(error), duration: 0 });
+      } finally {
+        activeFolderScans.current.delete(scanKey);
+        setLoading(activeFolderScans.current.size > 0);
+      }
+    });
+    folderScanQueue.current = scan.catch(() => undefined);
+    await scan;
   }
 
   const selectTrack = useCallback(function selectTrack(path?: string) {
     setSelectedPath(path);
-    if (detailTrack?.path !== path) setDetailTrack(undefined);
+    if (detailTrack?.path !== path) {
+      setDetailTrack(undefined);
+      setDetailCustomTags([]);
+    }
   }, [detailTrack]);
 
   const openTrackDetails = useCallback(async function openTrackDetails(path = selectedPath) {
     if (!path) return;
     setSelectedPath(path);
+    setDetailsMounted(true);
     setDetailsOpen(true);
-    if (detailTrack?.path === path) return;
+    if (detailTrack?.path === path && !staleDetailPaths.current.has(normalizePath(path))) return;
 
     const requestId = ++detailRequest.current;
+    staleDetailPaths.current.delete(normalizePath(path));
     setDetailTrack(undefined);
     setDetailsLoading(true);
     try {
-      const fullTrack = await loadLibraryTrack(path);
-      if (requestId === detailRequest.current) setDetailTrack(fullTrack);
+      const [fullTrack, customTags] = await Promise.all([
+        loadLibraryTrack(path),
+        loadCustomTags(path),
+      ]);
+      if (requestId === detailRequest.current) {
+        setDetailTrack(fullTrack);
+        setDetailCustomTags(customTags);
+      }
     } catch (error) {
+      staleDetailPaths.current.add(normalizePath(path));
       if (requestId === detailRequest.current) message.error(String(error));
     } finally {
       if (requestId === detailRequest.current) setDetailsLoading(false);
@@ -385,11 +628,21 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
 
   const refreshSelected = useCallback(async function refreshSelected() {
     if (!selectedTrack) return;
+    const requestedPath = selectedTrack.path;
     setLoading(true);
     try {
-      const refreshed = await readAudioFile(selectedTrack.path);
-      replaceTrack(refreshed);
-      setDetailTrack(refreshed);
+      const [refreshed, customTags] = await Promise.all([
+        readAudioFile(requestedPath),
+        loadCustomTags(requestedPath),
+      ]);
+      const nextTrack = replaceTrack(refreshed);
+      if (!nextTrack) {
+        message.error(t("common.operationFailed"));
+        return;
+      }
+      if (editingPathRef.current !== requestedPath) return;
+      setDetailTrack(nextTrack);
+      setDetailCustomTags(Array.isArray(customTags) ? customTags : []);
       message.success(t("messages.reloaded"));
     } catch (error) {
       message.error(String(error));
@@ -403,14 +656,23 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       message.warning(t("messages.selectSong"));
       return;
     }
+    const requestedPath = selectedTrack.path;
     setSaving(true);
     try {
       await form.validateFields();
       const values = completeTagForm(form.getFieldsValue(true), selectedTrack);
-      const saved = await saveAudioTags(selectedTrack.path, values);
-      replaceTrack(saved);
-      setDetailTrack(saved);
-      setSelectedPath(saved.path);
+      values.customTags = filterHiddenCustomTagEdits(values.customTags, detailCustomTags, desktopSettings);
+      const saved = await saveAudioTags(requestedPath, values);
+      const nextTrack = replaceTrack(saved);
+      if (!nextTrack) {
+        message.error(t("common.operationFailed"));
+        return;
+      }
+      setSelectedPath(nextTrack.path);
+      if (editingPathRef.current === requestedPath) {
+        setDetailTrack(nextTrack);
+        setDetailCustomTags(values.customTags);
+      }
       message.success(t("messages.saved"));
     } catch (error) {
       message.error(String(error));
@@ -418,23 +680,6 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       setSaving(false);
     }
   }
-
-  const openBatchForSelection = useCallback(function openBatchForSelection() {
-    if (selectedPaths.length === 0) {
-      message.warning(t("messages.selectSongs"));
-      return;
-    }
-    setDetailsOpen(false);
-    setAlbumDetailsOpen(false);
-    setArtistDetailsOpen(false);
-    setSelectionMode(false);
-    setActiveView("tasks");
-  }, [selectedPaths.length, t, message]);
-
-  const changeSelectionMode = useCallback(function changeSelectionMode(enabled: boolean) {
-    setSelectedPaths([]);
-    setSelectionMode(enabled);
-  }, []);
 
   const onChangeQuery = useCallback(setQuery, []);
   const onChangeSelectedPaths = useCallback(setSelectedPaths, []);
@@ -468,17 +713,32 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
 
   async function calculateSelectedReplayGain() {
     if (!selectedTrack || getReplayGainProgress()?.status === "running") return;
+    const requestedPath = selectedTrack.path;
     const jobId = crypto.randomUUID();
-    publishReplayGainProgress({ jobId, path: selectedTrack.path, percent: 0, status: "running" });
+    publishReplayGainProgress({ jobId, path: requestedPath, percent: 0, status: "running" });
     try {
-      const result = await analyzeReplayGain(selectedTrack.path, jobId, desktopSettings.replayGainTargetLoudness);
+      const result = await analyzeReplayGain(requestedPath, jobId, desktopSettings.replayGainTargetLoudness, desktopSettings.replayGainPeakMode ?? "samplePeak");
+      publishReplayGainProgress({ jobId, path: requestedPath, percent: 100, status: "completed" });
+      if (editingPathRef.current !== requestedPath) return;
       form.setFieldsValue({
         replayGainTrackGain: result.trackGain,
         replayGainTrackPeak: result.trackPeak,
         replayGainReferenceLoudness: result.referenceLoudness,
       });
-      message.success(t("messages.replayGainCalculated"));
+      if (result.warning) {
+        notification.warning({
+          title: t("messages.replayGainPartialAudio"),
+          description: t("messages.replayGainPartialAudioDetail", {
+            decoded: result.sampleCount,
+            declared: result.declaredSamples ?? result.sampleCount,
+          }),
+        });
+      } else {
+        notification.success({ title: t("messages.replayGainCalculated"), description: requestedPath });
+      }
     } catch (error) {
+      publishReplayGainProgress({ jobId, path: requestedPath, percent: 0, status: String(error).toLowerCase().includes("cancelled") ? "cancelled" : "failed", message: String(error) });
+      if (editingPathRef.current !== requestedPath) return;
       if (!String(error).toLocaleLowerCase().includes("cancelled")) message.error(String(error));
     }
   }
@@ -492,12 +752,12 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   }
 
   async function chooseLocalCover() {
-    const selected = await open({
+    const [selected] = await pickPaths({
       multiple: false,
       title: t("cover.choose"),
       filters: [{ name: t("cover.images"), extensions: ["jpg", "jpeg", "png", "webp", "gif"] }],
     });
-    if (typeof selected !== "string") return;
+    if (!selected) return;
     try {
       const coverDataUrl = await readImageFile(selected);
       form.setFieldsValue({ coverDataUrl, removeCover: false });
@@ -544,7 +804,7 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
     }
     const extension = dataUrl.startsWith("data:image/png") ? "png" : dataUrl.startsWith("data:image/webp") ? "webp" : dataUrl.startsWith("data:image/gif") ? "gif" : "jpg";
     const baseName = selectedTrack.fileName.replace(/\.[^.]+$/, "");
-    const destination = await save({
+    const destination = await pickSavePath({
       title: t("cover.export"),
       defaultPath: `${baseName}-cover.${extension}`,
       filters: [{ name: t("cover.images"), extensions: [extension] }],
@@ -559,12 +819,12 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   }
 
   async function importLyricsFile() {
-    const selected = await open({
+    const [selected] = await pickPaths({
       multiple: false,
       title: t("lyrics.import"),
       filters: [{ name: t("lyrics.files"), extensions: ["lrc", "ttml", "txt"] }],
     });
-    if (typeof selected !== "string") return;
+    if (!selected) return;
     try {
       form.setFieldValue("lyrics", await readTextFile(selected));
       message.success(t("messages.lyricsImported"));
@@ -582,7 +842,7 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
     try {
       const extension = await detectLyricsFormat(lyrics) === "ttml" ? "ttml" : "lrc";
       const baseName = selectedTrack.fileName.replace(/\.[^.]+$/, "");
-      const destination = await save({
+      const destination = await pickSavePath({
         title: t("lyrics.export"),
         defaultPath: `${baseName}.${extension}`,
         filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
@@ -604,77 +864,115 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
     await removeLibraryFolder(path).catch((error) => message.error(String(error)));
   }
 
-  function replaceTrack(nextTrack: AudioTrack) {
+  function replaceTrack(value: unknown) {
+    const nextTrack = asAudioTrack(value);
+    if (!nextTrack) return undefined;
+    staleDetailPaths.current.delete(normalizePath(nextTrack.path));
     setTracks((current) => current.map((track) => (samePath(track.path, nextTrack.path) ? nextTrack : track)));
-    updateCachedCover(nextTrack.path, nextTrack.coverDataUrl);
+    updateCachedCover(nextTrack.path);
+    return nextTrack;
   }
 
-  async function preparePluginInstall(): Promise<PluginInstallDraft | undefined> {
-    const archivePath = await open({
-      title: t("sources.install"),
-      multiple: false,
-      directory: false,
-      filters: [{ name: "Lyrico plugin", extensions: ["zip"] }],
-    });
-    if (typeof archivePath !== "string") return;
+  async function runPluginMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (pluginMutationInFlight.current) throw new Error(t("common.operationFailed"));
+    pluginMutationInFlight.current = true;
+    setPluginMutationBusy(true);
     try {
-      return { archivePath, preview: await previewSourcePluginArchive(archivePath) };
-    } catch (error) {
-      message.error(String(error));
-      return undefined;
+      return await operation();
+    } finally {
+      pluginMutationInFlight.current = false;
+      setPluginMutationBusy(false);
     }
   }
 
-  async function installPlugin(archivePath: string, selectedRoots: string[], allowDowngrade: boolean) {
-    try {
-      const result = await installSourcePluginArchive(archivePath, selectedRoots, allowDowngrade);
-      setPlugins(await loadSourcePlugins());
-      if (result.installed.length) message.success(t("sources.installSuccess", { count: result.installed.length }));
-      if (result.failed.length) {
-        message.error(result.failed.map((failure) => failure.reason).join("; "));
+  async function installPlugin() {
+    return runPluginMutation(async () => {
+      const [archivePath] = await pickPaths({
+        title: t("sources.install"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Lyrico plugin", extensions: ["zip"] }],
+      });
+      if (!archivePath) return;
+      try {
+        const result = await installSourcePluginArchive(archivePath);
+        setPlugins(await loadSourcePlugins());
+        if (result.installed.length) message.success(t("sources.installSuccess", { count: result.installed.length }));
+        if (result.failed.length) {
+          message.error(result.failed.map((failure) => failure.reason).join("; "));
+        }
+      } catch (error) {
+        message.error(String(error));
+        throw error;
       }
-    } catch (error) {
-      message.error(String(error));
-      throw error;
-    }
+    });
   }
 
-  async function changePluginSourceEnabled(pluginId: string, sourceKind: PluginSourceKind, enabled: boolean) {
-    try {
-      setPlugins(await setPluginSourceEnabled(pluginId, sourceKind, enabled));
-    } catch (error) {
-      message.error(String(error));
-      throw error;
-    }
-  }
-
-  async function changePluginSourceOrder(sourceKind: PluginSourceKind, pluginIds: string[]) {
-    try {
-      setPlugins(await reorderPluginSources(sourceKind, pluginIds));
-    } catch (error) {
-      message.error(String(error));
-      throw error;
-    }
+  async function changePluginEnabled(pluginId: string, sourceKind: PluginSourceKind, enabled: boolean) {
+    return runPluginMutation(async () => {
+      try {
+        setPlugins(await setPluginSourceEnabled(pluginId, sourceKind, enabled));
+      } catch (error) {
+        message.error(String(error));
+        throw error;
+      }
+    });
   }
 
   async function savePluginConfig(pluginId: string, config: Record<string, string>) {
+    return runPluginMutation(async () => {
+      try {
+        setPlugins(await saveSourcePluginSettings(pluginId, config));
+        message.success(t("sources.configSaved"));
+      } catch (error) {
+        message.error(String(error));
+        throw error;
+      }
+    });
+  }
+
+  async function shareSelected() {
+    if (!selectedTrack) return;
     try {
-      setPlugins(await saveSourcePluginSettings(pluginId, config));
-      message.success(t("sources.configSaved"));
+      await shareFile(fileUrlForShare(selectedTrack.path), {
+        mimeType: mimeTypeForTrack(selectedTrack),
+        title: selectedTrack.fileName,
+      });
+      message.success(t("messages.shared"));
     } catch (error) {
       message.error(String(error));
-      throw error;
     }
   }
 
+  async function movePluginOrder(sourceKind: PluginSourceKind, pluginIds: string[]) {
+    return runPluginMutation(async () => {
+      const previousStates = new Map(plugins.map(plugin => [plugin.id, plugin.sourceStates[sourceKind]]));
+      // dnd-kit expects the new items in the same render that clears activeId.
+      setPlugins(current => reorderPluginState(current, sourceKind, pluginIds));
+      try {
+        await reorderPluginSources(sourceKind, pluginIds);
+      } catch (error) {
+        setPlugins(current => current.map(plugin => {
+            const previous = previousStates.get(plugin.id);
+            const state = plugin.sourceStates[sourceKind];
+            return previous && state ? { ...plugin, sourceStates: { ...plugin.sourceStates, [sourceKind]: { ...state, priority: previous.priority } } } : plugin;
+        }));
+        message.error(String(error));
+        throw error;
+      }
+    });
+  }
+
   async function uninstallPlugin(pluginId: string) {
-    try {
-      setPlugins(await uninstallSourcePlugin(pluginId));
-      message.success(t("sources.uninstallSuccess"));
-    } catch (error) {
-      message.error(String(error));
-      throw error;
-    }
+    return runPluginMutation(async () => {
+      try {
+        setPlugins(await uninstallSourcePlugin(pluginId));
+        message.success(t("sources.uninstallSuccess"));
+      } catch (error) {
+        message.error(String(error));
+        throw error;
+      }
+    });
   }
 
   function changeLanguage(preference: LanguagePreference) {
@@ -692,13 +990,60 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
   }
 
   function changeDesktopSettings(settings: DesktopSettings) {
+    desktopSettingsRef.current = settings;
     setDesktopSettings(settings);
-    onThemeChange(settings.theme);
     settingsSaveQueue.current = settingsSaveQueue.current
       .then(() => saveDesktopSettings(settings))
       .catch((error) => {
         message.error(String(error));
       });
+  }
+
+  // 记录用户对关闭方式的选择后重新发起关闭请求，由托盘拦截逻辑决定隐藏还是真正关闭
+  function resolveClosePrompt(toTray: boolean) {
+    const saved = settingsSaveQueue.current.then(() => settingsLoad.current).then(async () => {
+      const next = { ...desktopSettingsRef.current, closeToTray: toTray, closeToTrayPrompted: true };
+      await saveDesktopSettings(next);
+      desktopSettingsRef.current = next;
+      setDesktopSettings(next);
+    });
+    // Keep the queue usable after a failure; the dialog reports this save's error.
+    settingsSaveQueue.current = saved.catch(() => undefined);
+    return saved
+      .then(async () => {
+        await getCurrentWindow().close();
+        setClosePromptOpen(false);
+      });
+  }
+
+  function changeLibrarySort(page: LibrarySortPage, sort?: LibrarySort) {
+    const next = { ...desktopSettings.librarySorts };
+    if (sort) next[page] = sort;
+    else delete next[page];
+    changeDesktopSettings({ ...desktopSettings, librarySorts: next });
+  }
+
+  function toggleFolderHidden(path: string) {
+    const hiddenFolders = desktopSettings.hiddenFolderPaths ?? [];
+    const hidden = hiddenFolders.some((folder) => samePath(folder, path));
+    const nextPaths = hidden
+      ? hiddenFolders.filter((folder) => !samePath(folder, path))
+      : [...hiddenFolders, path];
+    changeDesktopSettings({ ...desktopSettings, hiddenFolderPaths: nextPaths });
+    if (!hidden) {
+      const hiddenTrackPaths = new Set(tracks.filter((track) => isTrackUnderFolder(track.path, path)).map((track) => track.path));
+      setSelectedPaths((current) => current.filter((candidate) => !hiddenTrackPaths.has(candidate)));
+      if (selectedPath && hiddenTrackPaths.has(selectedPath)) selectTrack(undefined);
+    }
+  }
+
+  function reloadConfig() {
+    Promise.all([loadArtistSplitConfig(), loadDesktopSettings()])
+      .then(([split, settings]) => {
+        setArtistSplitConfig(split);
+        setDesktopSettings(normalizeDesktopSettings(settings));
+      })
+      .catch(() => undefined);
   }
 
   const changeView = useCallback((view: ViewKey) => {
@@ -713,83 +1058,82 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       case "albums":
         return (
           <AlbumsPage
+            onRefreshLibrary={refreshLibrary}
+            canRefreshLibrary={folders.length > 0}
             albums={albums}
             query={query}
             selectedAlbumId={selectedAlbumId}
-            selectedPath={selectedPath}
             detailsOpen={albumDetailsOpen}
             loading={loading}
             onChangeQuery={onChangeQuery}
             onSelectAlbum={onSelectAlbum}
-            onSelectTrack={selectTrack}
             onOpenTrack={onAlbumOpenTrack}
             onOpenDetails={onAlbumOpenDetails}
             onCloseDetails={onAlbumCloseDetails}
             selectedPaths={selectedPaths}
-            selectionMode={selectionMode}
             onChangeSelectedPaths={onChangeSelectedPaths}
-            onChangeSelectionMode={changeSelectionMode}
-            onOpenBatch={openBatchForSelection}
+            sort={desktopSettings.librarySorts.albums as SortState<AlbumSortField> | undefined}
+            onSortChange={(sort) => changeLibrarySort("albums", sort)}
           />
         );
       case "artists":
         return (
           <ArtistsPage
+            onRefreshLibrary={refreshLibrary}
+            canRefreshLibrary={folders.length > 0}
             artists={artists}
             query={query}
             selectedArtistId={selectedArtistId}
-            selectedPath={selectedPath}
             detailsOpen={artistDetailsOpen}
             loading={loading}
             onChangeQuery={onChangeQuery}
             onSelectArtist={onSelectArtist}
-            onSelectTrack={selectTrack}
             onOpenTrack={onArtistOpenTrack}
             onOpenDetails={onArtistOpenDetails}
             onCloseDetails={onArtistCloseDetails}
             selectedPaths={selectedPaths}
-            selectionMode={selectionMode}
             onChangeSelectedPaths={onChangeSelectedPaths}
-            onChangeSelectionMode={changeSelectionMode}
-            onOpenBatch={openBatchForSelection}
+            artistPosterFolder={desktopSettings.artistPosterFolder}
+            sort={desktopSettings.librarySorts.artists as SortState<ArtistSortField> | undefined}
+            onSortChange={(sort) => changeLibrarySort("artists", sort)}
           />
         );
       case "folders":
         return (
           <FoldersPage
+            onRefreshLibrary={refreshLibrary}
             folders={folders}
             tracks={tracks}
-            selectedFolderPath={selectedFolderPath}
-            selectedTrackPath={selectedPath}
             loading={loading}
             onAddFolders={addFolders}
             onRescanFolder={scanAndMergeFolder}
             onRemoveFolder={removeFolder}
+            hiddenFolderPaths={desktopSettings.hiddenFolderPaths}
+            onToggleFolderHidden={toggleFolderHidden}
             onSelectFolder={setSelectedFolderPath}
-            onSelectTrack={selectTrack}
             onOpenTrack={openTrackDetails}
             selectedPaths={selectedPaths}
-            selectionMode={selectionMode}
             onChangeSelectedPaths={onChangeSelectedPaths}
-            onChangeSelectionMode={changeSelectionMode}
-            onOpenBatch={openBatchForSelection}
+            folderSort={desktopSettings.librarySorts.folders as SortState<FolderSortField> | undefined}
+            onFolderSortChange={(sort) => changeLibrarySort("folders", sort)}
           />
         );
       case "sources":
         return (
           <PluginsPage
+            mutationBusy={pluginMutationBusy}
             plugins={plugins}
-            onPrepareInstall={preparePluginInstall}
             onInstall={installPlugin}
-            onChangeSourceEnabled={changePluginSourceEnabled}
-            onChangeSourceOrder={changePluginSourceOrder}
+            onChangeEnabled={changePluginEnabled}
             onSaveConfig={savePluginConfig}
             onUninstall={uninstallPlugin}
+            onMoveOrder={movePluginOrder}
           />
         );
       case "tasks":
         return (
           <TasksPage
+            onChooseSongs={() => setActiveView("songs")}
             tracks={tracks}
             plugins={plugins}
             selectedPaths={selectedPaths}
@@ -807,26 +1151,25 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
             onChangeLanguage={changeLanguage}
             onChangeArtistSplitConfig={changeArtistSplitConfig}
             onChangeSettings={changeDesktopSettings}
+            onReloadConfig={reloadConfig}
           />
         );
       case "songs":
       default:
         return (
           <SongsPage
+            onAddFolders={addFolders}
+            onRefreshLibrary={refreshLibrary}
+            canRefreshLibrary={folders.length > 0}
             tracks={filteredTracks}
             query={query}
-            selectedTrack={selectedTrack}
-            selectedPath={selectedPath}
             selectedPaths={selectedPaths}
             loading={loading}
             onChangeQuery={onChangeQuery}
-            onSelectTrack={selectTrack}
             onChangeSelectedPaths={onChangeSelectedPaths}
-            selectionMode={selectionMode}
-            onChangeSelectionMode={changeSelectionMode}
-            onOpenBatch={openBatchForSelection}
-            onReloadTrack={refreshSelected}
             onOpenDetails={openTrackDetails}
+            sort={desktopSettings.librarySorts.songs as SortState<TrackSortField> | undefined}
+            onSortChange={(sort) => changeLibrarySort("songs", sort)}
           />
         );
     }
@@ -840,8 +1183,8 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
 
   return (
     <>
-    <TitleBar />
-    {!detailsOpen ? <Form form={form} component={false} /> : null}
+    {!detailsMounted ? <Form form={form} component={false} /> : null}
+      <AppErrorBoundary>
       <Shell
       activeView={activeView}
       folders={folders}
@@ -852,22 +1195,24 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
       onCancelReplayGain={cancelActiveReplayGain}
       onRemoveSelectedTrack={onRemoveSelectedTrack}
       onClearSelectedTracks={onClearSelectedTracks}
-      onOpenSelectedBatch={openBatchForSelection}
     >
       <Suspense fallback={<PageFallback />}>
-      <PageViewport key={activeView} scrollKey={activeScrollKey} hidden={detailsOpen}>
+      <PageViewport key={activeView} scrollKey={activeScrollKey} hidden={false}>
         {renderActivePage()}
       </PageViewport>
-      {detailsOpen ? <div className="page-viewport detail-page-viewport"><SongDetails
+      {detailsMounted ? <SongDetails
         open={detailsOpen}
         loading={detailsLoading}
         track={selectedTrack}
         plugins={plugins}
         settings={desktopSettings}
+        originalCustomTags={detailCustomTags}
+        onChangeSettings={changeDesktopSettings}
         form={form}
         saving={saving}
         onSave={saveSelected}
         onReload={refreshSelected}
+        onShare={shareSelected}
         onCalculateReplayGain={calculateSelectedReplayGain}
         onCancelReplayGain={cancelActiveReplayGain}
         onChooseCover={chooseLocalCover}
@@ -878,17 +1223,36 @@ function LyricoDesktop({ onThemeChange }: { onThemeChange: (theme: DesktopSettin
         onImportLyrics={importLyricsFile}
         onExportLyrics={exportLyricsFile}
         onClose={() => setDetailsOpen(false)}
-      /></div> : null}
+        onAfterClose={() => setDetailsMounted(false)}
+      /> : null}
       </Suspense>
     </Shell>
+      </AppErrorBoundary>
     <AppContextMenu onNavigate={changeView} />
+    <CloseBehaviorDialog
+      open={closePromptOpen}
+      onCancel={() => setClosePromptOpen(false)}
+      onConfirm={resolveClosePrompt}
+    />
     </>
   );
 }
 
-function upsertFolder(folders: LibraryFolder[], folder: LibraryFolder) {
-  const rest = folders.filter((candidate) => !samePath(candidate.path, folder.path));
-  return [...rest, folder].sort((left, right) => left.path.localeCompare(right.path));
+function mimeTypeForTrack(track: AudioTrack) {
+  const extension = track.fileName.split(".").pop()?.toLowerCase();
+  const known: Record<string, string> = {
+    mp3: "audio/mpeg",
+    flac: "audio/flac",
+    m4a: "audio/mp4",
+    mp4: "audio/mp4",
+    aac: "audio/aac",
+    ogg: "audio/ogg",
+    opus: "audio/opus",
+    wav: "audio/wav",
+    aiff: "audio/aiff",
+    aif: "audio/aiff",
+  };
+  return known[extension ?? ""] ?? "application/octet-stream";
 }
 
 function renamePathMap(items: BatchTaskItem[]) {
@@ -930,5 +1294,13 @@ function normalizeFolderPath(path: string) {
 }
 
 function normalizePath(path: string) {
-  return path.replace(/\\/g, "/").toLocaleLowerCase();
+  return folderPathKey(path);
+}
+
+/** IPC tag results are typed but may be null/undefined when the backend returns nothing. */
+function asAudioTrack(value: unknown): AudioTrack | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<AudioTrack>;
+  if (typeof candidate.path !== "string" || candidate.path.length === 0) return undefined;
+  return candidate as AudioTrack;
 }

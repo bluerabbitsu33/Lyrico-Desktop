@@ -18,19 +18,26 @@
         "minWidth": 720,
         "minHeight": 520,
         "center": true,
-        "decorations": false
+        "visible": false,
+        "decorations": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.github.com; img-src 'self' data: https://avatars.githubusercontent.com; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "resources": {
+      "native/ffmpeg/runtime/": "ffmpeg/",
+      "resources/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt"
+    },
     "windows": {
       "nsis": {
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "displayLanguageSelector": true,
         "installerHooks": "./nsis/installer-hooks.nsh"
       }

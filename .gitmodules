@@ -1,0 +1,6 @@
+[submodule "src-tauri/native/taglib/upstream"]
+	path = src-tauri/native/taglib/upstream
+	url = https://github.com/taglib/taglib.git
+[submodule "src-tauri/native/ffmpeg/upstream"]
+	path = src-tauri/native/ffmpeg/upstream
+	url = https://github.com/FFmpeg/FFmpeg.git

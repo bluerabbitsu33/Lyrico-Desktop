@@ -1,219 +1,335 @@
-import { ApiOutlined, AppstoreAddOutlined, ArrowDownOutlined, ArrowLeftOutlined, ArrowUpOutlined, DeleteOutlined, SettingOutlined } from "@ant-design/icons";
-import { Alert, Avatar, Button, Card, Checkbox, Empty, Flex, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Tag, Tabs, Typography } from "antd";
-import { useEffect, useMemo, useState } from "react";
+import { ApiOutlined, AppstoreAddOutlined, DeleteOutlined, SaveOutlined } from "@ant-design/icons";
+import { Avatar, Button, Form, Input, InputNumber, Modal, Select, Switch, Tag, Tabs, Tooltip } from "antd";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
-import type { PluginConfigField, PluginInstallDraft, PluginSourceKind, SourcePlugin } from "../app/types";
+import type { PluginConfigField, PluginSourceKind, SourcePlugin } from "../app/types";
+import { EmptyState } from "../components/EmptyState";
+import { PageHeader } from "../components/PageHeader";
+import { Panel } from "../components/Panel";
+import { SortableList } from "../components/SortableList";
+import { pluginSources } from "../data/pluginSources";
 import { capabilityLabel } from "../data/pluginCatalog";
-import { isPluginSourceEnabled, normalizedCapabilities, pluginSourceOrder, supportedSourceKinds } from "../domain/pluginSources";
+import { formatTimeValue } from "../utils/format";
+import "./PluginsPage.css";
 
-const { Title, Text, Paragraph } = Typography;
-const SOURCE_KINDS: PluginSourceKind[] = ["aggregated", "metadata", "lyrics", "covers"];
+const pluginTypeTabs: PluginSourceKind[] = ["metadata", "lyrics", "covers"];
 
 type PluginsPageProps = {
+  mutationBusy: boolean;
   plugins: SourcePlugin[];
-  onPrepareInstall: () => Promise<PluginInstallDraft | undefined>;
-  onInstall: (archivePath: string, selectedRoots: string[], allowDowngrade: boolean) => Promise<void>;
-  onChangeSourceEnabled: (pluginId: string, sourceKind: PluginSourceKind, enabled: boolean) => Promise<void>;
-  onChangeSourceOrder: (sourceKind: PluginSourceKind, pluginIds: string[]) => Promise<void>;
+  onInstall: () => Promise<void>;
+  onChangeEnabled: (pluginId: string, sourceKind: PluginSourceKind, enabled: boolean) => Promise<void>;
   onSaveConfig: (pluginId: string, config: Record<string, string>) => Promise<void>;
   onUninstall: (pluginId: string) => Promise<void>;
+  onMoveOrder: (sourceKind: PluginSourceKind, pluginIds: string[]) => Promise<void>;
 };
 
-export function PluginsPage({ plugins, onPrepareInstall, onInstall, onChangeSourceEnabled, onChangeSourceOrder, onSaveConfig, onUninstall }: PluginsPageProps) {
+/**
+ * Installed plugins: fixed list rail on the left (drag to change priority),
+ * detail of the selected plugin on the right. See docs/ui-layout.md.
+ */
+export function PluginsPage({ mutationBusy, plugins, onInstall, onChangeEnabled, onSaveConfig, onUninstall, onMoveOrder }: PluginsPageProps) {
   const { t } = useTranslation();
-  const [sourceKind, setSourceKind] = useState<PluginSourceKind>("aggregated");
-  const [editingPluginId, setEditingPluginId] = useState<string>();
+  const [sourceKind, setSourceKind] = useState<PluginSourceKind>("metadata");
+  const [detailTab, setDetailTab] = useState("configuration");
+  const [uninstallTarget, setUninstallTarget] = useState<SourcePlugin>();
+  const visiblePlugins = useMemo(() => pluginSources(plugins, sourceKind), [plugins, sourceKind]);
+  const [selectedPluginId, setSelectedPluginId] = useState<string>();
   const [config, setConfig] = useState<Record<string, string>>({});
+  const [baseline, setBaseline] = useState<Record<string, string>>({});
   const [busyAction, setBusyAction] = useState<string>();
-  const [installDraft, setInstallDraft] = useState<PluginInstallDraft>();
-  const [selectedInstallRoots, setSelectedInstallRoots] = useState<string[]>([]);
-  const editingPlugin = plugins.find((plugin) => plugin.id === editingPluginId);
-  const visiblePlugins = useMemo(() => plugins
-    .filter((plugin) => supportedSourceKinds(plugin).includes(sourceKind))
-    .sort((left, right) => pluginSourceOrder(left, sourceKind) - pluginSourceOrder(right, sourceKind) || left.name.localeCompare(right.name)), [plugins, sourceKind]);
+  const actionInFlight = useRef(false);
 
-  useEffect(() => setConfig(editingPlugin?.config ?? {}), [editingPlugin]);
+  const selectedPlugin = visiblePlugins.find((plugin) => plugin.id === selectedPluginId) ?? visiblePlugins[0];
+  const selectedId = selectedPlugin?.id;
 
+  useEffect(() => {
+    if (!visiblePlugins.some((plugin) => plugin.id === selectedPluginId)) {
+      setSelectedPluginId(visiblePlugins[0]?.id);
+    }
+  }, [visiblePlugins, selectedPluginId]);
+
+  // Snapshot on entering or switching a plugin: it is both the form draft and the
+  // dirty baseline. Keyed by id so a list refresh (install, enable, reorder) does
+  // not silently wipe edits the user has not saved yet.
+  useEffect(() => {
+    const snapshot = { ...plugins.find((plugin) => plugin.id === selectedId)?.config };
+    setConfig(snapshot);
+    setBaseline(snapshot);
+  }, [selectedId]);
+
+  const manifest = useMemo(() => {
+    if (!selectedPlugin) return "";
+    const {
+      sourceStates: _sourceStates,
+      enabled: _enabled,
+      sortOrder: _sortOrder,
+      installedAt: _installedAt,
+      updatedAt: _updatedAt,
+      pluginDir: _pluginDir,
+      iconPath: _iconPath,
+      iconDataUrl: _iconDataUrl,
+      config: _config,
+      ...pluginManifest
+    } = selectedPlugin;
+    return JSON.stringify(pluginManifest, null, 2);
+  }, [selectedPlugin]);
+
+  const dirty = useMemo(() => !sameConfig(config, baseline), [config, baseline]);
+
+  // Action handlers already report their own failure through a message, so a
+  // rejected action must not leave a dangling unhandled rejection here.
   async function runAction(key: string, action: () => Promise<void>) {
+    if (mutationBusy || actionInFlight.current) return;
+    actionInFlight.current = true;
     setBusyAction(key);
-    try { await action(); } finally { setBusyAction(undefined); }
-  }
-
-  async function choosePluginArchive() {
-    setBusyAction("prepare-install");
     try {
-      const draft = await onPrepareInstall();
-      if (!draft) return;
-      setInstallDraft(draft);
-      setSelectedInstallRoots(draft.preview.candidates
-        .filter((candidate) => candidate.conflict !== "downgrade")
-        .map((candidate) => candidate.relativeRoot));
+      await action();
+    } catch {
+      // reported by the owning handler
     } finally {
+      actionInFlight.current = false;
       setBusyAction(undefined);
     }
   }
 
-  async function confirmInstall() {
-    if (!installDraft || selectedInstallRoots.length === 0) return;
-    const allowDowngrade = installDraft.preview.candidates.some((candidate) =>
-      selectedInstallRoots.includes(candidate.relativeRoot) && candidate.conflict === "downgrade");
-    await runAction("install", async () => {
-      await onInstall(installDraft.archivePath, selectedInstallRoots, allowDowngrade);
-      setInstallDraft(undefined);
-      setSelectedInstallRoots([]);
+  function updateConfig(key: string, value: string) {
+    setConfig((current) => ({ ...current, [key]: value }));
+  }
+
+  function install() {
+    return runAction("install", onInstall);
+  }
+
+  function saveConfig(pluginId: string) {
+    return runAction("save", async () => {
+      await onSaveConfig(pluginId, config);
+      setBaseline(config);
     });
   }
 
-  async function movePlugin(index: number, offset: -1 | 1) {
-    const target = index + offset;
-    if (target < 0 || target >= visiblePlugins.length) return;
-    const reordered = [...visiblePlugins];
-    const [moved] = reordered.splice(index, 1);
-    reordered.splice(target, 0, moved);
-    await runAction(`order:${moved.id}`, () => onChangeSourceOrder(sourceKind, reordered.map((plugin) => plugin.id)));
-  }
+  function renderDetail(plugin: SourcePlugin) {
+    const fields = plugin.configFields.filter((field) => dependencyMatches(field.dependency, config));
 
-  const manifest = editingPlugin ? JSON.stringify(stripRuntimeFields(editingPlugin), null, 2) : "";
+    return (
+      <section className="plugin-detail">
+        <div className="plugin-detail-header">
+          <PluginIcon plugin={plugin} size={32} />
+          <span className="plugin-detail-name" title={plugin.name}>{plugin.name}</span>
+          <Tag className="plugin-version">v{plugin.versionName}</Tag>
+          {detailTab === "configuration" && fields.some(field => field.type !== "markdown") ? (
+            <Button className="plugin-config-save" type="primary" icon={<SaveOutlined />}
+              disabled={!dirty || mutationBusy || Boolean(busyAction)} loading={busyAction === "save"}
+              onClick={() => void saveConfig(plugin.id)}>{t("common.save")}</Button>
+          ) : null}
+        </div>
 
-  if (editingPlugin) {
-    return <div className="workspace page-stack detail-subpage plugin-detail-page">
-      <header className="subpage-toolbar">
-        <Button type="text" icon={<ArrowLeftOutlined />} onClick={() => setEditingPluginId(undefined)}>{t("common.back")}</Button>
-        <Text strong>{editingPlugin.name}</Text>
-      </header>
-      <section className="plugin-detail-summary">
-        <PluginIcon plugin={editingPlugin} />
-        <div className="plugin-detail-copy">
-          <Space size={8} wrap><Title level={3}>{editingPlugin.name}</Title><Tag>v{editingPlugin.versionName}</Tag><Tag>API {editingPlugin.apiVersion}</Tag></Space>
-          <Text type="secondary">{editingPlugin.author || t("sources.unknownAuthor")}</Text>
-          {editingPlugin.description ? <Paragraph type="secondary">{editingPlugin.description}</Paragraph> : null}
+        <div className="plugin-detail-body">
+          {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
+          <div className="plugin-tags">
+            {plugin.capabilities.map((capability) => <Tag key={capability}>{capabilityLabel(capability)}</Tag>)}
+            <Tag>Plugin API {plugin.apiVersion}</Tag>
+            <Tag>Host API ≥ {plugin.minHostApiVersion}</Tag>
+          </div>
+          <p className="plugin-timestamps">
+            <span>{t("sources.installedAt", { value: formatTimeValue(plugin.installedAt) })}</span>
+            <span>{t("sources.updatedAt", { value: formatTimeValue(plugin.updatedAt) })}</span>
+          </p>
+
+          <Tabs
+            className="plugin-tabs"
+            activeKey={detailTab}
+            onChange={setDetailTab}
+            items={[
+              {
+                key: "configuration",
+                label: t("sources.configuration"),
+                children: fields.length ? (
+                  <Form layout="vertical" className="plugin-config-form" disabled={(mutationBusy || Boolean(busyAction))}>
+                    {fields.map((field) => (
+                      <ConfigField
+                        key={field.key}
+                        field={field}
+                        value={config[field.key] ?? field.defaultValue ?? ""}
+                        onChange={(value) => updateConfig(field.key, value)}
+                      />
+                    ))}
+
+                  </Form>
+                ) : <EmptyState description={t("sources.noConfiguration")} />,
+              },
+              { key: "manifest", label: t("sources.manifest"), children: <pre className="plugin-manifest">{manifest}</pre> },
+            ]}
+          />
         </div>
       </section>
-      <Tabs className="plugin-detail-tabs" items={[
-        { key: "configuration", label: t("sources.configuration"), children: editingPlugin.configFields.length ? <Form layout="vertical" className="source-config-form">
-          {editingPlugin.configFields.filter((field) => dependencyMatches(field.dependency, config)).map((field) => <ConfigField key={field.key} field={field} value={config[field.key] ?? field.defaultValue ?? ""} onChange={(value) => setConfig((current) => ({ ...current, [field.key]: value }))} />)}
-          <Button type="primary" loading={busyAction === "save"} onClick={() => void runAction("save", async () => { await onSaveConfig(editingPlugin.id, config); setEditingPluginId(undefined); })}>{t("common.save")}</Button>
-        </Form> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t("sources.noConfiguration")} /> },
-        { key: "manifest", label: t("sources.manifest"), children: <pre className="code-preview">{manifest}</pre> },
-      ]} />
-    </div>;
+    );
   }
 
   return (
-    <div className="workspace page-stack plugin-manager-page">
-      <Flex className="workspace-page-header" justify="space-between" align="start" gap={16} wrap>
-        <Title level={2}>{t("sources.title")}</Title>
-        <Button type="primary" icon={<AppstoreAddOutlined />} loading={busyAction === "prepare-install"} onClick={() => void choosePluginArchive()}>{t("sources.install")}</Button>
-      </Flex>
+    <div className="page-shell plugin-page">
+      <PageHeader
+        title={t("sources.title")}
+        meta={t("sources.installedCount", { count: plugins.length })}
+        actions={plugins.length ? (
+          <Button
+            type="primary"
+            icon={<AppstoreAddOutlined />}
+            loading={busyAction === "install"}
+            disabled={(mutationBusy || Boolean(busyAction))}
+            onClick={() => void install()}
+          >
+            {t("sources.install")}
+          </Button>
+        ) : undefined}
+      />
 
-      <div className="plugin-mode-bar" role="tablist">
-        {SOURCE_KINDS.map((kind) => <Button key={kind} type={sourceKind === kind ? "primary" : "text"} role="tab" aria-selected={sourceKind === kind} onClick={() => setSourceKind(kind)}>{t(`sources.types.${kind}`)}</Button>)}
-      </div>
-
-      {visiblePlugins.length ? <section className="plugin-workspace">
-        <div className="plugin-workspace-heading">
-          <Text strong>{t(`sources.types.${sourceKind}`)}</Text>
-          <Text type="secondary">{t("sources.priorityHint")}</Text>
+      {plugins.length === 0 ? (
+        <div className="page-body plugin-body plugin-body-empty">
+          <EmptyState
+            description={t("sources.none")}
+            action={
+              <Button type="primary" loading={busyAction === "install"} disabled={(mutationBusy || Boolean(busyAction))} onClick={() => void install()}>
+                {t("sources.install")}
+              </Button>
+            }
+          />
         </div>
-        {visiblePlugins.map((plugin, index) => {
-          const enabled = isPluginSourceEnabled(plugin, sourceKind);
-          const orderBusy = busyAction?.startsWith("order:");
-          return <div key={plugin.id} className={`plugin-row${enabled ? " is-enabled" : ""}`}>
-            <Flex align="center" gap={14}>
-              <PluginIcon plugin={plugin} />
-              <Flex vertical gap={3} className="plugin-source-card-copy">
-                <Space size={8} wrap><Text strong>{plugin.name}</Text><Tag>v{plugin.versionName}</Tag><Tag>API {plugin.apiVersion}</Tag></Space>
-                <Text type="secondary">{plugin.author || t("sources.unknownAuthor")}</Text>
-                {plugin.description ? <Paragraph type="secondary" ellipsis={{ rows: 1 }} className="plugin-row-description">{plugin.description}</Paragraph> : null}
-              </Flex>
-              <div className="plugin-row-actions">
-                <Text className="plugin-priority-label" type="secondary">{t("sources.priority", { value: index + 1 })}</Text>
-                <Button aria-label={t("sources.moveUp")} icon={<ArrowUpOutlined />} disabled={index === 0 || orderBusy} onClick={() => void movePlugin(index, -1)} />
-                <Button aria-label={t("sources.moveDown")} icon={<ArrowDownOutlined />} disabled={index === visiblePlugins.length - 1 || orderBusy} onClick={() => void movePlugin(index, 1)} />
-                <Switch checked={enabled} loading={busyAction === `enabled:${plugin.id}`} checkedChildren={t("common.enabled")} unCheckedChildren={t("common.disabled")} onChange={(next) => void runAction(`enabled:${plugin.id}`, () => onChangeSourceEnabled(plugin.id, sourceKind, next))} />
+      ) : (
+        <div className="page-body plugin-body">
+          <div className="plugin-layout">
+            <Panel
+              className="plugin-list-panel"
+              bodyClassName="plugin-list-body"
+            >
+              <Tabs
+                className="plugin-source-tabs"
+                activeKey={sourceKind}
+                onChange={key => setSourceKind(key as PluginSourceKind)}
+                items={pluginTypeTabs.map(key => ({ key, label: t(`sources.kinds.${key}`), disabled: (mutationBusy || Boolean(busyAction)) }))}
+              />
+              {visiblePlugins.length === 0 ? <EmptyState description={t("sources.noneInCategory")} /> : null}
+              <SortableList
+                disabled={(mutationBusy || Boolean(busyAction))}
+                items={visiblePlugins.map((plugin) => plugin.id)}
+                label={t("sources.installed")}
+                labelFor={(id) => plugins.find((plugin) => plugin.id === id)?.name ?? id}
+                onChange={(ids) => { void runAction("order", () => onMoveOrder(sourceKind, ids)); }}
+                renderItem={(id) => {
+                  const plugin = plugins.find((item) => item.id === id);
+                  if (!plugin) return null;
+                  const active = selectedId === id;
+                  return (
+                    <div className={`plugin-item${active ? " is-active" : ""}`}>
+                      <button
+                        type="button"
+                        className="plugin-item-select"
+                        disabled={(mutationBusy || Boolean(busyAction))}
+                        aria-current={active ? "true" : undefined}
+                        onClick={() => setSelectedPluginId(id)}
+                      >
+                        <PluginIcon plugin={plugin} size={28} />
+                        <span className="plugin-item-copy">
+                          <span className="plugin-item-name" title={plugin.name}>{plugin.name}</span>
+                          <span className="plugin-item-meta" title={plugin.author}>v{plugin.versionName}{plugin.author ? ` / ${plugin.author}` : ""}</span>
+                        </span>
+                      </button>
+                      <div className="plugin-item-actions">
+                        <Tooltip title={t(plugin.sourceStates[sourceKind]?.enabled ? "common.enabled" : "common.disabled")}>
+                          <Switch
+                            size="small"
+                            checked={Boolean(plugin.sourceStates[sourceKind]?.enabled)}
+                            loading={busyAction === `enabled:${id}`}
+                            disabled={(mutationBusy || Boolean(busyAction))}
+                            aria-label={t("sources.toggleEnabled", { name: plugin.name })}
+                            onChange={(enabled) => void runAction(`enabled:${id}`, () => onChangeEnabled(id, sourceKind, enabled))}
+                          />
+                        </Tooltip>
+                        <Tooltip title={t("sources.uninstall")}>
+                          <Button size="small" danger type="text" icon={<DeleteOutlined />}
+                            aria-label={t("sources.uninstallNamed", { name: plugin.name })}
+                            disabled={(mutationBusy || Boolean(busyAction))} onClick={() => setUninstallTarget(plugin)} />
+                        </Tooltip>
+                      </div>
+                    </div>
+                  );
+                }}
+              />
+            </Panel>
+
+            {selectedPlugin ? renderDetail(selectedPlugin) : (
+              <div className="plugin-detail plugin-detail-empty">
+                <EmptyState description={t("sources.select")} />
               </div>
-            </Flex>
-            <Flex justify="space-between" align="center" gap={12} wrap className="plugin-row-footer">
-              <Space size={[4, 6]} wrap>{normalizedCapabilities(plugin).map((capability) => <Tag key={capability}>{capabilityLabel(capability)}</Tag>)}</Space>
-              <Space>
-                <Button icon={<SettingOutlined />} onClick={() => setEditingPluginId(plugin.id)}>{t("sources.configuration")}</Button>
-                <Popconfirm title={t("sources.uninstallConfirm", { name: plugin.name })} okButtonProps={{ danger: true }} onConfirm={() => runAction(`uninstall:${plugin.id}`, () => onUninstall(plugin.id))}>
-                  <Button danger icon={<DeleteOutlined />} loading={busyAction === `uninstall:${plugin.id}`}>{t("sources.uninstall")}</Button>
-                </Popconfirm>
-              </Space>
-            </Flex>
-          </div>;
-        })}
-      </section> : <section className="plugin-workspace"><Empty className="page-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description={plugins.length ? t("sources.noneForType") : t("sources.none")} /></section>}
-
-      <Modal
-        title={t("sources.installTitle")}
-        open={Boolean(installDraft)}
-        okText={t("sources.installConfirm")}
-        cancelText={t("common.cancel")}
-        okButtonProps={{ disabled: selectedInstallRoots.length === 0, loading: busyAction === "install" }}
-        cancelButtonProps={{ disabled: busyAction === "install" }}
-        closable={busyAction !== "install"}
-        maskClosable={busyAction !== "install"}
-        onOk={() => void confirmInstall()}
-        onCancel={() => { setInstallDraft(undefined); setSelectedInstallRoots([]); }}
-        width={680}
-        destroyOnHidden
-      >
-        {installDraft ? <Space orientation="vertical" size={12} className="full-width">
-          {installDraft.preview.candidates.map((candidate) => {
-            const selected = selectedInstallRoots.includes(candidate.relativeRoot);
-            const version = candidate.existingVersionName
-              ? `${candidate.existingVersionName} → ${candidate.manifest.versionName}`
-              : candidate.manifest.versionName;
-            return <Card key={candidate.relativeRoot} size="small" className={`plugin-install-candidate${selected ? " is-selected" : ""}`} onClick={() => setSelectedInstallRoots((current) => selected ? current.filter((root) => root !== candidate.relativeRoot) : [...current, candidate.relativeRoot])}>
-              <Flex align="center" gap={12}>
-                <Avatar shape="square" size={42} src={candidate.iconDataUrl} icon={<ApiOutlined />} />
-                <Flex vertical gap={3} className="plugin-source-card-copy">
-                  <Space size={8} wrap>
-                    <Text strong>{candidate.manifest.name}</Text>
-                    <Tag color={conflictColor(candidate.conflict)}>{t(`sources.conflicts.${candidate.conflict}`)}</Tag>
-                  </Space>
-                  <Text type="secondary">{version}{candidate.manifest.author ? ` · ${candidate.manifest.author}` : ""}</Text>
-                  <Space size={[4, 4]} wrap>{candidate.manifest.capabilities.map((capability) => <Tag key={capability}>{capabilityLabel(capability)}</Tag>)}</Space>
-                  {candidate.manifest.description ? <Text type="secondary">{candidate.manifest.description}</Text> : null}
-                </Flex>
-                <Checkbox checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => setSelectedInstallRoots((current) => event.target.checked ? [...new Set([...current, candidate.relativeRoot])] : current.filter((root) => root !== candidate.relativeRoot))} />
-              </Flex>
-            </Card>;
-          })}
-          {installDraft.preview.failed.map((failure) => <Alert key={`${failure.rootPath}:${failure.reason}`} type="error" showIcon message={failure.pluginId || failure.rootPath || t("sources.invalidPlugin")} description={failure.reason} />)}
-        </Space> : null}
+            )}
+          </div>
+        </div>
+      )}
+      <Modal centered open={Boolean(uninstallTarget)} title={t("sources.uninstallConfirm", { name: uninstallTarget?.name })}
+        okText={t("sources.uninstall")} cancelText={t("common.cancel")} okButtonProps={{ danger: true }}
+        confirmLoading={busyAction === "uninstall"} onCancel={() => setUninstallTarget(undefined)}
+        onOk={() => void runAction("uninstall", async () => {
+          if (uninstallTarget) await onUninstall(uninstallTarget.id);
+          setUninstallTarget(undefined);
+        })}>
+        {t("sources.uninstallDetail")}
       </Modal>
-
     </div>
   );
 }
 
-function stripRuntimeFields(plugin: SourcePlugin) {
-  const { sourceStates: _sourceStates, installedAt: _installedAt, updatedAt: _updatedAt, pluginDir: _pluginDir, iconPath: _iconPath, iconDataUrl: _iconDataUrl, config: _config, ...manifest } = plugin;
-  return manifest;
-}
-
-function PluginIcon({ plugin }: { plugin: SourcePlugin }) { return <Avatar shape="square" size={48} src={plugin.iconDataUrl} icon={<ApiOutlined />} />; }
-
-function conflictColor(conflict: "new" | "update" | "overwrite" | "downgrade") {
-  if (conflict === "downgrade") return "error";
-  if (conflict === "overwrite") return "warning";
-  return "processing";
+function PluginIcon({ plugin, size }: { plugin: SourcePlugin; size: number }) {
+  return <Avatar shape="square" size={size} src={plugin.iconDataUrl} icon={<ApiOutlined />} />;
 }
 
 function ConfigField({ field, value, onChange }: { field: PluginConfigField; value: string; onChange: (value: string) => void }) {
-  if (field.type === "markdown") return <section className="plugin-markdown-field">{field.title ? <Text strong>{field.title}</Text> : null}<div className="plugin-markdown-content"><ReactMarkdown skipHtml>{field.defaultValue || field.summary || ""}</ReactMarkdown></div></section>;
+  if (field.type === "markdown") {
+    return (
+      <section className="plugin-markdown">
+        {field.title ? <span className="plugin-markdown-heading">{field.title}</span> : null}
+        <div className="plugin-markdown-body">
+          <ReactMarkdown skipHtml>{field.defaultValue || field.summary || ""}</ReactMarkdown>
+        </div>
+      </section>
+    );
+  }
+
+  const controlId = `plugin-config-${field.key}`;
   let control;
-  if (field.type === "password") control = <Input.Password value={value} onChange={(event) => onChange(event.target.value)} />;
-  else if (field.type === "number") control = <InputNumber value={value === "" ? null : Number(value)} className="full-width" onChange={(next) => onChange(next == null ? "" : String(next))} />;
-  else if (field.type === "switch") control = <Switch checked={value === "true"} onChange={(next) => onChange(String(next))} />;
-  else if (field.type === "dropdown") control = <Select value={value || undefined} options={field.options?.map((option) => ({ value: option.value, label: option.label }))} onChange={onChange} />;
-  else if (field.type === "textarea") control = <Input.TextArea value={value} autoSize={{ minRows: 3, maxRows: 8 }} onChange={(event) => onChange(event.target.value)} />;
-  else control = <Input value={value} onChange={(event) => onChange(event.target.value)} />;
-  return <Form.Item label={field.title} required={field.required} extra={field.summary}>{control}</Form.Item>;
+  switch (field.type) {
+    case "password":
+      control = <Input.Password id={controlId} value={value} onChange={(event) => onChange(event.target.value)} />;
+      break;
+    case "number":
+      control = <InputNumber id={controlId} value={value === "" ? null : Number(value)} onChange={(next) => onChange(next == null ? "" : String(next))} />;
+      break;
+    case "switch":
+      control = <Switch id={controlId} checked={value === "true"} onChange={(next) => onChange(String(next))} />;
+      break;
+    case "dropdown":
+      control = <Select id={controlId} value={value || undefined} options={field.options?.map((option) => ({ value: option.value, label: option.label }))} onChange={onChange} />;
+      break;
+    case "textarea":
+      control = <Input.TextArea id={controlId} value={value} autoSize={{ minRows: 3, maxRows: 8 }} onChange={(event) => onChange(event.target.value)} />;
+      break;
+    default:
+      control = <Input id={controlId} value={value} onChange={(event) => onChange(event.target.value)} />;
+  }
+
+  return (
+    <Form.Item label={field.title} htmlFor={controlId} required={field.required} extra={field.summary}>
+      {control}
+    </Form.Item>
+  );
+}
+
+function sameConfig(left: Record<string, string>, right: Record<string, string>): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if ((left[key] ?? "") !== (right[key] ?? "")) return false;
+  }
+  return true;
 }
 
 function dependencyMatches(dependency: unknown, config: Record<string, string>): boolean {
@@ -226,5 +342,6 @@ function dependencyMatches(dependency: unknown, config: Record<string, string>):
   const or = value.or as { conditions?: unknown[] } | undefined;
   if (or) return Array.isArray(or.conditions) && or.conditions.some((condition) => dependencyMatches(condition, config));
   const not = value.not as { condition?: unknown } | undefined;
-  return not ? !dependencyMatches(not.condition, config) : false;
+  if (not) return !dependencyMatches(not.condition, config);
+  return false;
 }

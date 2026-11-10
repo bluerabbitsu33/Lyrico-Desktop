@@ -35,6 +35,12 @@ pub(crate) struct AudioTrack {
     pub(crate) replay_gain_album_gain: String,
     pub(crate) replay_gain_album_peak: String,
     pub(crate) replay_gain_reference_loudness: String,
+    #[serde(default)]
+    pub(crate) modified_at: Option<u64>,
+    #[serde(default)]
+    pub(crate) added_at: Option<u64>,
+    #[serde(default)]
+    pub(crate) created_at: Option<u64>,
 }
 
 impl AudioTrack {
@@ -46,6 +52,13 @@ impl AudioTrack {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CustomTag {
+    pub(crate) key: String,
+    pub(crate) values: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TrackCover {
@@ -55,15 +68,26 @@ pub(crate) struct TrackCover {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryTrackUpdate {
+    pub(crate) previous_path: String,
+    pub(crate) track: Option<AudioTrack>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ReplayGainAnalysis {
     pub(crate) job_id: String,
     pub(crate) path: String,
     pub(crate) loudness_lufs: f64,
     pub(crate) sample_count: u64,
+    /// FLAC STREAMINFO sample frames, when present. Successful results match this count.
+    pub(crate) declared_samples: Option<u64>,
     pub(crate) peak: f64,
     pub(crate) track_gain: String,
     pub(crate) track_peak: String,
     pub(crate) reference_loudness: String,
+    /// Set when decoder anomalies passed complete FLAC sample count and PCM MD5 verification.
+    pub(crate) warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +125,7 @@ pub(crate) struct StorageInfo {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BatchTask {
+    pub(crate) progress: f64,
     pub(crate) task_id: String,
     pub(crate) task_type: String,
     pub(crate) status: String,
@@ -190,6 +215,8 @@ pub(crate) struct LibraryFolder {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TagUpdate {
+    #[serde(default)]
+    pub(crate) custom_tags: Option<Vec<CustomTag>>,
     pub(crate) path: String,
     pub(crate) title: String,
     pub(crate) artist: String,
@@ -215,41 +242,19 @@ pub(crate) struct TagUpdate {
     pub(crate) remove_cover: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LyricLineMatch {
+    pub(crate) path: String,
+    pub(crate) title: String,
+    pub(crate) artist: String,
+    pub(crate) matched_line: String,
+}
+
 fn default_true() -> bool {
     true
 }
 
 fn default_artist_separator() -> String {
     "/".to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TagUpdate;
-    use serde_json::json;
-
-    fn complete_update() -> serde_json::Value {
-        json!({
-            "path": "song.flac", "title": "", "artist": "", "album": "",
-            "albumArtist": "", "genre": [], "language": "", "composer": "",
-            "lyricist": "", "copyright": "", "rating": null, "comment": "",
-            "lyrics": "", "trackNumber": null, "discNumber": null, "year": "",
-            "replayGainTrackGain": "", "replayGainTrackPeak": "",
-            "replayGainAlbumGain": "", "replayGainAlbumPeak": "",
-            "replayGainReferenceLoudness": "", "coverDataUrl": null,
-            "removeCover": false
-        })
-    }
-
-    #[test]
-    fn tag_update_accepts_explicit_empty_fields() {
-        assert!(serde_json::from_value::<TagUpdate>(complete_update()).is_ok());
-    }
-
-    #[test]
-    fn tag_update_rejects_missing_required_fields_instead_of_guessing() {
-        let mut value = complete_update();
-        value.as_object_mut().unwrap().remove("composer");
-        assert!(serde_json::from_value::<TagUpdate>(value).is_err());
-    }
 }

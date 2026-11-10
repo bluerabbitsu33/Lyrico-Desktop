@@ -1,150 +1,101 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { loadTrackCovers } from "../backend/audioApi";
+import { ImageCache } from "../domain/imageCache";
 
-const coverCache = new Map<string, string>();
-const pendingRequests = new Map<string, { promise: Promise<void>; resolve: () => void }>();
-const queuedPaths = new Set<string>();
-const defaultRetryDelays = [0, 150, 500];
-let flushTimer: ReturnType<typeof setTimeout> | undefined;
+function createQueue(artwork: boolean, budget: number) {
+  return {
+    artwork,
+    cache: new ImageCache(budget),
+    pending: new Map<string, { promise: Promise<string | undefined>; resolve: (value?: string) => void }>(),
+    queued: new Set<string>(),
+    running: false,
+  };
+}
+const thumbnailQueue = createQueue(false, 8 * 1024 * 1024);
+const artworkQueue = createQueue(true, 24 * 1024 * 1024);
+type CoverQueue = ReturnType<typeof createQueue>;
+const listeners = new Set<(paths: string[]) => void>();
 
-export function useTrackCovers(paths: string[]) {
-  const [version, setVersion] = useState(0);
-  const pathKey = paths.join("\u0000");
-
-  useEffect(() => {
-    const requestedPaths = pathKey ? pathKey.split("\u0000") : [];
-    if (requestedPaths.every((path) => coverCache.has(cacheKey(path, false)))) return;
-
-    let cancelled = false;
-    void preloadTrackCovers(requestedPaths).finally(() => {
-      if (!cancelled) setVersion((value) => value + 1);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [pathKey]);
-
-  return useMemo(() => {
-    const covers = new Map<string, string>();
-    for (const path of paths) {
-      const cover = coverCache.get(cacheKey(path, false));
-      if (cover) covers.set(path, cover);
+function load(path: string, queue: CoverQueue) {
+  if (queue.cache.has(path)) return Promise.resolve(queue.cache.get(path));
+  let pending = queue.pending.get(path);
+  if (!pending) {
+    let resolve: (value?: string) => void = () => {};
+    const promise = new Promise<string | undefined>(next => { resolve = next; });
+    pending = { promise, resolve };
+    queue.pending.set(path, pending);
+    queue.queued.add(path);
+    if (!queue.running) {
+      queue.running = true;
+      globalThis.setTimeout(() => void flush(queue), 16);
     }
-    return covers;
-  }, [pathKey, version]);
+  }
+  return pending.promise;
+}
+
+async function flush(queue: CoverQueue) {
+  while (queue.queued.size) {
+    const paths = [...queue.queued].slice(0, 8);
+    const requests = paths.map(path => queue.pending.get(path));
+    for (const path of paths) queue.queued.delete(path);
+    let covers: Awaited<ReturnType<typeof loadTrackCovers>> = [];
+    try { covers = await loadTrackCovers(paths, queue.artwork); } catch { /* Keep failed reads retryable. */ }
+    for (let index = 0; index < paths.length; index++) {
+      const path = paths[index];
+      const request = requests[index];
+      // An old completion must not replace a request created after invalidation.
+      if (request && queue.pending.get(path) === request) {
+        const value = covers.find(cover => cover.path === path)?.coverDataUrl;
+        if (value) queue.cache.set(path, value);
+        queue.pending.delete(path);
+        request.resolve(value);
+      }
+    }
+  }
+  queue.running = false;
 }
 
 export function useTrackCover(path: string | undefined, enabled = true, artwork = false) {
-  const [version, setVersion] = useState(0);
+  const queue = artwork ? artworkQueue : thumbnailQueue;
+  const [revision, setRevision] = useState(0);
+  const [result, setResult] = useState<{ path: string; artwork: boolean; revision: number; value?: string }>();
   useEffect(() => {
-    if (!enabled || !path || coverCache.has(cacheKey(path, artwork))) return;
-    let cancelled = false;
-    void preloadTrackCovers([path], defaultRetryDelays, artwork).finally(() => {
-      if (!cancelled) setVersion((value) => value + 1);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [artwork, enabled, path]);
-  void version;
-  return path ? coverCache.get(cacheKey(path, artwork)) : undefined;
+    const listener = (paths: string[]) => { if (path && paths.includes(path)) setRevision(value => value + 1); };
+    listeners.add(listener);
+    return () => { listeners.delete(listener); };
+  }, [path]);
+  useEffect(() => {
+    setResult(undefined);
+    if (!enabled || !path) return;
+    let disposed = false;
+    void (async () => {
+      for (const delay of [0, 150, 500]) {
+        if (delay) await new Promise(resolve => globalThis.setTimeout(resolve, delay));
+        if (disposed) return;
+        const value = await load(path, queue);
+        if (disposed) return;
+        if (value) { setResult({ path, artwork, revision, value }); return; }
+      }
+    })();
+    return () => { disposed = true; };
+  }, [enabled, path, artwork, queue, revision]);
+  // Visible images retain a reference; LRU eviction must not create a reload loop.
+  return enabled && result && result.path === path && result.artwork === artwork && result.revision === revision ? result.value : undefined;
 }
 
-export function updateCachedCover(path: string, coverDataUrl?: string) {
-  if (coverDataUrl) {
-    coverCache.set(cacheKey(path, false), coverDataUrl);
-    coverCache.set(cacheKey(path, true), coverDataUrl);
-  } else {
-    coverCache.delete(cacheKey(path, false));
-    coverCache.delete(cacheKey(path, true));
-  }
-}
-
-export async function preloadTrackCovers(paths: string[], retryDelays = defaultRetryDelays, artwork = false) {
-  const uniquePaths = [...new Set(paths.filter(Boolean))];
-  for (const delay of retryDelays) {
-    const missingPaths = uniquePaths.filter((path) => !coverCache.has(cacheKey(path, artwork)));
-    if (missingPaths.length === 0) return;
-    if (delay > 0) await wait(delay);
-
-    const pending = requestCoverBatch(missingPaths, artwork);
-    await Promise.allSettled(pending);
-  }
-}
-
-export function readCachedTrackCover(path: string, artwork = false) {
-  return coverCache.get(cacheKey(path, artwork));
-}
-
-export function resetTrackCoverCache() {
-  coverCache.clear();
-  pendingRequests.clear();
-  queuedPaths.clear();
-  if (flushTimer !== undefined) globalThis.clearTimeout(flushTimer);
-  flushTimer = undefined;
-}
-
-function requestCoverBatch(paths: string[], artwork: boolean) {
-  const requests: Promise<void>[] = [];
-  for (const path of paths) {
-    const key = cacheKey(path, artwork);
-    if (coverCache.has(key)) continue;
-    let pending = pendingRequests.get(key);
-    if (!pending) {
-      let resolve: () => void = () => {};
-      const promise = new Promise<void>((next) => {
-        resolve = next;
-      });
-      pending = { promise, resolve };
-      pendingRequests.set(key, pending);
-      queuedPaths.add(key);
+export function invalidateCachedCovers(paths: string[]) {
+  for (const queue of [thumbnailQueue, artworkQueue]) {
+    for (const path of paths) {
+      queue.cache.delete(path);
+      queue.pending.get(path)?.resolve();
+      queue.pending.delete(path);
+      queue.queued.delete(path);
     }
-    requests.push(pending.promise);
   }
-  scheduleFlush();
-  return [...new Set(requests)];
+  if (paths.length) for (const listener of listeners) listener(paths);
 }
 
-function scheduleFlush() {
-  if (flushTimer !== undefined || queuedPaths.size === 0) return;
-  flushTimer = globalThis.setTimeout(() => {
-    flushTimer = undefined;
-    void flushCoverQueue();
-  }, 16);
-}
-
-async function flushCoverQueue() {
-  const firstKey = queuedPaths.values().next().value as string | undefined;
-  if (!firstKey) return;
-  const artwork = firstKey.startsWith("artwork\u0000");
-  const keys = [...queuedPaths].filter((key) => key.startsWith(artwork ? "artwork\u0000" : "thumbnail\u0000")).slice(0, 16);
-  const paths = keys.map(pathFromKey);
-  for (const key of keys) queuedPaths.delete(key);
-  try {
-    const covers = artwork ? await loadTrackCovers(paths, true) : await loadTrackCovers(paths);
-    for (const cover of covers) {
-      if (cover.coverDataUrl) coverCache.set(cacheKey(cover.path, artwork), cover.coverDataUrl);
-    }
-  } catch {
-    // A failed load remains a cache miss so preloadTrackCovers can retry it.
-  } finally {
-    for (const key of keys) {
-      pendingRequests.get(key)?.resolve();
-      pendingRequests.delete(key);
-    }
-    scheduleFlush();
-  }
-}
-
-function cacheKey(path: string, artwork: boolean) {
-  return `${artwork ? "artwork" : "thumbnail"}\u0000${path}`;
-}
-
-function pathFromKey(key: string) {
-  return key.slice(key.indexOf("\u0000") + 1);
-}
-
-function wait(milliseconds: number) {
-  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
+export function updateCachedCover(path: string) {
+  // Originals belong in the editor; reload sized previews after saving.
+  invalidateCachedCovers([path]);
 }

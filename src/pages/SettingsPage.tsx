@@ -1,12 +1,33 @@
-import { ApiOutlined, CalculatorOutlined, GlobalOutlined, ScissorOutlined, SoundOutlined } from "@ant-design/icons";
-import { Button, Card, InputNumber, Modal, Radio, Select, Space, Switch, Tabs, Typography } from "antd";
-import { useState, type ReactNode } from "react";
+import { DeleteOutlined, PlusOutlined, ReloadOutlined, ApiOutlined, AudioOutlined, EditOutlined, FileTextOutlined, FolderOpenOutlined, GlobalOutlined, InfoCircleOutlined, ImportOutlined, ExportOutlined, ScissorOutlined, SoundOutlined } from "@ant-design/icons";
+import { App as AntApp, Avatar, Button, Flex, Input, InputNumber, Modal, Select, Space, Switch, Tabs, Typography } from "antd";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import type { ArtistSplitConfig, DesktopSettings } from "../app/types";
+import type { ArtistSplitConfig, DesktopSettings, LyricLineTrack } from "../app/types";
 import type { LanguagePreference } from "../i18n";
+import { SortableList } from "../components/SortableList";
+import appIcon from "../assets/app-icon.png";
 import { ArtistSplitSettings } from "../components/ArtistSplitSettings";
+import { PageHeader } from "../components/PageHeader";
+import { loadLibraryCustomTagKeys, exportConfig, importConfig, openLogsDirectory, pickPaths, pickSavePath, type ThemeMode } from "../backend/audioApi";
+import { normalizeCleanupKeywords, normalizeLyricLineOrder } from "../domain/lyricsSettings";
+import { customTagKeyOf, normalizeCustomTagKey, withAddedCustomTag, withRemovedCustomTag, normalizeEditFieldOrder, EDIT_FIELD_LABEL_KEYS, REPLAY_GAIN_BLOCK_KEY, toEditFieldBlocks, withEditFieldBlockMembers } from "../domain/editFieldSettings";
+import { CONTRIBUTORS } from "../data/contributors";
 
-const { Title, Text } = Typography;
+const { Text } = Typography;
+
+function LyricLineOrderEditor({ value, onChange }: { value: LyricLineTrack[]; onChange: (value: LyricLineTrack[]) => void }) {
+  const { t } = useTranslation();
+  const labels: Record<LyricLineTrack, string> = {
+    original: t("settings.lyricOriginal"),
+    romanization: t("settings.lyricRomanization"),
+    translation: t("settings.lyricTranslation"),
+  };
+  return <SortableList items={value} label={t("settings.lyricLineOrder")} labelFor={key => labels[key as LyricLineTrack]}
+    onChange={next => onChange(next as LyricLineTrack[])} renderItem={key => <Text>{labels[key as LyricLineTrack]}</Text>} />;
+
+}
 
 export function SettingsPage({
   languagePreference,
@@ -15,6 +36,7 @@ export function SettingsPage({
   onChangeLanguage,
   onChangeArtistSplitConfig,
   onChangeSettings,
+  onReloadConfig,
 }: {
   languagePreference: LanguagePreference;
   artistSplitConfig: ArtistSplitConfig;
@@ -22,37 +44,19 @@ export function SettingsPage({
   onChangeLanguage: (language: LanguagePreference) => void;
   onChangeArtistSplitConfig: (config: ArtistSplitConfig) => void;
   onChangeSettings: (settings: DesktopSettings) => void;
+  onReloadConfig: () => void;
 }) {
   const { t } = useTranslation();
-  const [replayGainDialogOpen, setReplayGainDialogOpen] = useState(false);
-  const [replayGainPreset, setReplayGainPreset] = useState<string>(String(settings.replayGainTargetLoudness));
-  const [customLoudness, setCustomLoudness] = useState<number | null>(settings.replayGainTargetLoudness);
   const update = <K extends keyof DesktopSettings>(key: K, value: DesktopSettings[K]) => onChangeSettings({ ...settings, [key]: value });
 
-  function openReplayGainDialog() {
-    const preset = [-23, -18, -14].includes(settings.replayGainTargetLoudness)
-      ? String(settings.replayGainTargetLoudness)
-      : "custom";
-    setReplayGainPreset(preset);
-    setCustomLoudness(settings.replayGainTargetLoudness);
-    setReplayGainDialogOpen(true);
-  }
-
-  function saveReplayGainTarget() {
-    const value = replayGainPreset === "custom" ? customLoudness : Number(replayGainPreset);
-    if (value == null || !Number.isFinite(value) || value < -60 || value > 0) return;
-    update("replayGainTargetLoudness", value);
-    setReplayGainDialogOpen(false);
-  }
-
   return (
-    <div className="workspace page-stack settings-view">
-      <Title level={2}>{t("settings.title")}</Title>
+    <div className="page-shell settings-view">
+      <PageHeader title={t("settings.title")} />
 
-      <Card className="content-card settings-card" styles={{ body: { padding: 0 } }}>
+      <div className="page-body settings-body">
         <Tabs
           className="settings-tabs"
-          tabPosition="left"
+          tabPlacement="start"
           items={[
             {
               key: "interface",
@@ -71,14 +75,25 @@ export function SettingsPage({
                       ]}
                     />
                   </SettingRow>
-                  <SettingRow title={t("settings.themeMode")}>
-                    <Select<DesktopSettings["theme"]>
-                      value={settings.theme}
-                      onChange={(value) => update("theme", value)}
+                  <SettingRow title={t("settings.themeMode")} description={t("settings.themeModeHint")}>
+                    <Select<ThemeMode>
+                      value={settings.themeMode ?? "system"}
+                      onChange={(value) => update("themeMode", value)}
                       options={[
+                        { value: "system", label: t("settings.themeSystem") },
                         { value: "light", label: t("settings.themeLight") },
                         { value: "dark", label: t("settings.themeDark") },
-                        { value: "system", label: t("settings.themeSystem") },
+                      ]}
+                    />
+                  </SettingRow>
+                  <SettingRow title={t("settings.closeToTray")}>
+                    <Select<"tray" | "quit">
+                      aria-label={t("settings.closeToTray")}
+                      value={settings.closeToTray ? "tray" : "quit"}
+                      onSelect={value => onChangeSettings({ ...settings, closeToTray: value === "tray", closeToTrayPrompted: true })}
+                      options={[
+                        { value: "tray", label: t("common.closePrompt.tray") },
+                        { value: "quit", label: t("common.closePrompt.close") },
                       ]}
                     />
                   </SettingRow>
@@ -122,17 +137,17 @@ export function SettingsPage({
                   <SettingRow title={t("settings.onlyTranslation")} description={t("settings.onlyTranslationHint")}><Switch disabled={!settings.showTranslation} checked={settings.onlyTranslationIfAvailable} onChange={(value) => update("onlyTranslationIfAvailable", value)} /></SettingRow>
                   <SettingRow title={t("settings.includeRomanization")} description={t("settings.includeRomanizationHint")}><Switch checked={settings.showRomanization} onChange={(value) => update("showRomanization", value)} /></SettingRow>
                   <SettingRow title={t("settings.removeEmptyLyricLines")} description={t("settings.removeEmptyLyricLinesHint")}><Switch checked={settings.removeEmptyLyricLines} onChange={(value) => update("removeEmptyLyricLines", value)} /></SettingRow>
-                </SettingsSection>
-              ),
-            },
-            {
-              key: "replayGain",
-              label: t("settings.replayGain"),
-              icon: <CalculatorOutlined />,
-              children: (
-                <SettingsSection title={t("settings.replayGain")}>
-                  <SettingRow title={t("settings.replayGainTargetLoudness")} description={t("settings.replayGainTargetLoudnessHint")}>
-                    <Button onClick={openReplayGainDialog}>{formatLoudness(settings.replayGainTargetLoudness)}</Button>
+                  <SettingRow title={t("settings.lyricLineOrder")} description={t("settings.lyricLineOrderHint")}>
+                    <LyricLineOrderEditor
+                      value={normalizeLyricLineOrder(settings.lyricLineOrder)}
+                      onChange={(value) => update("lyricLineOrder", value)}
+                    />
+                  </SettingRow>
+                  <SettingRow title={t("settings.cleanupKeywords")} description={t("settings.cleanupKeywordsHint")}>
+                    <CleanupKeywordsEditor
+                      keywords={settings.removeTagLineKeywords}
+                      onChange={(value) => update("removeTagLineKeywords", value)}
+                    />
                   </SettingRow>
                 </SettingsSection>
               ),
@@ -142,59 +157,240 @@ export function SettingsPage({
               label: t("settings.library"),
               icon: <ScissorOutlined />,
               children: (
-                <SettingsSection title={t("artistSplit.title")}>
+                <SettingsSection title={t("settings.library")}>
+                  <SettingRow title={t("settings.artistPosterFolder")} description={t("settings.artistPosterFolderHint")}>
+                    <Space wrap className="settings-path-control">
+                      <Text type="secondary" ellipsis={{ tooltip: settings.artistPosterFolder }} style={{ maxWidth: 260 }}>{settings.artistPosterFolder || t("settings.artistPosterFolderNone")}</Text>
+                      <Button
+                        icon={<FolderOpenOutlined />}
+                        onClick={async () => {
+                          const [selected] = await pickPaths({ directory: true, multiple: false, title: t("settings.artistPosterFolder") });
+                          if (selected) update("artistPosterFolder", selected);
+                        }}
+                      >
+                        {t("settings.chooseFolder")}
+                      </Button>
+                    </Space>
+                  </SettingRow>
+                  <SettingRow title={t("settings.ignoreShortAudio")} description={t("settings.ignoreShortAudioHint")}>
+                    <Switch checked={settings.ignoreShortAudio} onChange={(value) => update("ignoreShortAudio", value)} />
+                  </SettingRow>
+                  <SettingRow title={t("settings.lyricIndex")} description={t("settings.lyricIndexHint")}>
+                    <Switch checked={settings.lyricIndexEnabled} onChange={(value) => update("lyricIndexEnabled", value)} />
+                  </SettingRow>
                   <ArtistSplitSettings config={artistSplitConfig} onChange={onChangeArtistSplitConfig} />
                 </SettingsSection>
               ),
             },
+            {
+              key: "editFields",
+              label: t("settings.editFields"),
+              icon: <EditOutlined />,
+              children: (
+                  <SettingsSection title={t("settings.editFields")}>
+                    <EditFieldOrderEditor settings={settings} onChange={onChangeSettings} />
+                  </SettingsSection>
+              ),
+            },
+            {
+              key: "audio",
+              label: t("settings.audio"),
+              icon: <AudioOutlined />,
+              children: (
+                <SettingsSection title={t("settings.audio")}>
+                  <SettingRow title={t("settings.replayGainTarget")} description={t("settings.replayGainTargetHint")}>
+                    <Flex gap={8} align="center">
+                      <InputNumber
+                        min={-30}
+                        max={0}
+                        step={0.5}
+                        precision={1}
+                        value={settings.replayGainTargetLoudness ?? -18}
+                        onChange={(value) => update("replayGainTargetLoudness", value ?? -18)}
+                      />
+                      <Text type="secondary">LUFS</Text>
+                    </Flex>
+                  </SettingRow>
+                  <SettingRow title={t("settings.replayGainPeakMode")} description={t("settings.replayGainPeakHint")}>
+                    <Select value={settings.replayGainPeakMode ?? "samplePeak"} onChange={value => update("replayGainPeakMode", value)} options={[
+                      { value: "samplePeak", label: t("settings.replayGainSamplePeak") },
+                      { value: "truePeak", label: t("settings.replayGainTruePeak") },
+                    ]} />
+                  </SettingRow>
+                </SettingsSection>
+              ),
+            },
+            {
+              key: "backup",
+              label: t("settings.backup"),
+              icon: <ExportOutlined />,
+              children: (
+                <SettingsSection title={t("settings.backup")}>
+                  <SettingRow title={t("settings.exportConfig")} description={t("settings.exportConfigHint")}>
+                    <BackupExportButton />
+                  </SettingRow>
+                  <SettingRow title={t("settings.importConfig")} description={t("settings.importConfigHint")}>
+                    <BackupImportButton onImported={onReloadConfig} />
+                  </SettingRow>
+                </SettingsSection>
+              ),
+            },
+            {
+              key: "logs",
+              label: t("settings.logs"),
+              icon: <FileTextOutlined />,
+              children: (
+                <AppLogsSection />
+              ),
+            },
+            {
+              key: "about",
+              label: t("settings.about"),
+              icon: <InfoCircleOutlined />,
+              children: <AboutSection />,
+            },
           ]}
         />
-      </Card>
-
-      <Modal
-        title={t("settings.replayGainTargetLoudness")}
-        open={replayGainDialogOpen}
-        okText={t("common.save")}
-        cancelText={t("common.cancel")}
-        okButtonProps={{ disabled: replayGainPreset === "custom" && (customLoudness == null || customLoudness < -60 || customLoudness > 0) }}
-        onOk={saveReplayGainTarget}
-        onCancel={() => setReplayGainDialogOpen(false)}
-        destroyOnHidden
-      >
-        <Space orientation="vertical" size={12} className="full-width">
-          <Radio.Group value={replayGainPreset} onChange={(event) => setReplayGainPreset(event.target.value)} className="full-width">
-            <Space orientation="vertical" className="full-width">
-              <Radio value="-23">{t("settings.replayGainPresetEbu")}</Radio>
-              <Radio value="-18">{t("settings.replayGainPresetDefault")}</Radio>
-              <Radio value="-14">{t("settings.replayGainPresetStreaming")}</Radio>
-              <Radio value="custom">{t("settings.replayGainPresetCustom")}</Radio>
-            </Space>
-          </Radio.Group>
-          {replayGainPreset === "custom" ? <InputNumber
-            min={-60}
-            max={0}
-            precision={2}
-            value={customLoudness}
-            addonAfter="LUFS"
-            placeholder={t("settings.replayGainCustomPlaceholder")}
-            className="full-width"
-            onChange={setCustomLoudness}
-          /> : null}
-          {replayGainPreset === "custom" && (customLoudness == null || customLoudness < -60 || customLoudness > 0)
-            ? <Typography.Text type="danger">{t("settings.replayGainTargetInvalid")}</Typography.Text>
-            : null}
-        </Space>
-      </Modal>
+      </div>
     </div>
   );
 }
 
-function formatLoudness(value: number) {
-  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2)} LUFS`;
+/** Title is optional: the About tab leads with the app identity instead of a section heading. */
+function SettingsSection({ title, children }: { title?: string; children: ReactNode }) {
+  return <section className="settings-section">{title ? <Typography.Title level={4}>{title}</Typography.Title> : null}{children}</section>;
 }
 
-function SettingsSection({ title, children }: { title: string; children: ReactNode }) {
-  return <section className="settings-section"><Typography.Title level={4}>{title}</Typography.Title>{children}</section>;
+/**
+ * Field order editor. Ordering works on blocks, not raw fields: the ReplayGain values are one
+ * measurement and always move as one adjacent group. A composite row opens a dialog to reorder
+ * and toggle its members, mirroring the mobile app's component sheet. See docs/ui-layout.md.
+ */
+function EditFieldOrderEditor({ settings, onChange }: { settings: DesktopSettings; onChange: (settings: DesktopSettings) => void }) {
+  const { t } = useTranslation();
+  const { modal } = AntApp.useApp();
+  const [adding, setAdding] = useState(false);
+  const [input, setInput] = useState("");
+  const [inputError, setInputError] = useState<string>();
+  const [available, setAvailable] = useState<string[]>([]);
+  const [loadingKeys, setLoadingKeys] = useState(false);
+  const [keysError, setKeysError] = useState<string>();
+  const [openBlock, setOpenBlock] = useState<string>();
+  useEffect(() => {
+    if (!adding) return;
+    let active = true;
+    setLoadingKeys(true);
+    setKeysError(undefined);
+    loadLibraryCustomTagKeys().then(result => {
+      if (!active) return;
+      setAvailable(result.keys);
+      if (result.unreadable) setKeysError(t("settings.customKeysUnreadable", { count: result.unreadable }));
+    }).catch(error => { if (active) setKeysError(String(error)); })
+      .finally(() => { if (active) setLoadingKeys(false); });
+    return () => { active = false; };
+  }, [adding, t]);
+  function addKey(key: string) {
+    const normalized = normalizeCustomTagKey(key);
+    if (!normalized) { setInputError(t(key.trim() ? "settings.customKeyInvalid" : "settings.customKeyEmpty")); return; }
+    if (settings.editCustomTags.includes(normalized)) { setInputError(t("settings.customKeyDuplicate")); return; }
+    onChange(withAddedCustomTag(settings, normalized));
+    setAdding(false);
+  }
+  const blocks = useMemo(() => toEditFieldBlocks(normalizeEditFieldOrder(settings.editFieldOrder, settings.editCustomTags)), [settings.editFieldOrder, settings.editCustomTags]);
+  const labelOf = (key: string) => customTagKeyOf(key) ?? t(EDIT_FIELD_LABEL_KEYS.find(([field]) => field === key)?.[1] ?? key);
+  const shown = (key: string) => settings.editFieldVisibility?.[key] !== false;
+  const setShown = (key: string, checked: boolean) =>
+    onChange({ ...settings, editFieldVisibility: { ...settings.editFieldVisibility, [key]: checked } });
+  const setMembersShown = (members: readonly string[], checked: boolean) =>
+    onChange({ ...settings, editFieldVisibility: { ...settings.editFieldVisibility, ...Object.fromEntries(members.map((key) => [key, checked])) } });
+
+  const composite = blocks.find((block) => block.key === openBlock && block.composite);
+
+  return (
+    <>
+      <Flex gap={8} justify="end" style={{ marginBottom: 12 }}>
+        <Button icon={<ReloadOutlined />} onClick={() => modal.confirm({ centered: true, title: t("settings.resetFields"), content: t("settings.resetFieldsConfirm"), onOk: () => onChange({ ...settings, editCustomTags: [], editFieldOrder: normalizeEditFieldOrder([]), editFieldVisibility: {} }) })}>{t("settings.resetFields")}</Button>
+        <Button icon={<PlusOutlined />} onClick={() => { setInput(""); setInputError(undefined); setAvailable([]); setAdding(true); }}>{t("settings.addCustomField")}</Button>
+      </Flex>
+      <Modal centered open={adding} title={t("settings.addCustomField")} onCancel={() => setAdding(false)} onOk={() => addKey(input)}>
+        <Space orientation="vertical" className="full-width">
+          <Select className="full-width" loading={loadingKeys} placeholder={t("settings.customKeysFromLibrary")} value={undefined} options={available.filter(key => !settings.editCustomTags.includes(key)).map(key => ({ value: key, label: key }))} onChange={addKey} />
+          {keysError ? <Text type="warning">{keysError}</Text> : null}
+          <Input aria-label={t("details.customTagKey")} placeholder={t("details.customTagKey")} value={input} status={inputError ? "error" : undefined} onChange={event => { setInput(event.target.value); setInputError(undefined); }} onPressEnter={() => addKey(input)} />
+          <Text type={inputError ? "danger" : "secondary"}>{inputError ?? t("settings.customKeyHint")}</Text>
+        </Space>
+      </Modal>
+      <SortableList
+        items={blocks.map((block) => block.key)}
+        label={t("settings.editFields")}
+        labelFor={(key) => (key === REPLAY_GAIN_BLOCK_KEY ? t("settings.replayGain") : labelOf(key))}
+        onChange={(keys) => {
+          const byKey = new Map(blocks.map((block) => [block.key, block]));
+          onChange({ ...settings, editFieldOrder: keys.flatMap((key) => byKey.get(key)?.fields ?? []) });
+        }}
+        renderItem={(key) => {
+          const block = blocks.find((candidate) => candidate.key === key);
+          if (!block?.composite) {
+            return <>
+              <Text ellipsis={{ tooltip: labelOf(key) }} style={{ flex: 1, minWidth: 0 }}>{labelOf(key)}</Text>
+              <Space size={4}>
+              {customTagKeyOf(key) ? <Button type="text" danger size="small" icon={<DeleteOutlined />} aria-label={t("settings.removeCustomField", { name: labelOf(key) })} onClick={() => modal.confirm({ centered: true, title: t("settings.removeCustomField", { name: labelOf(key) }), content: t("settings.removeCustomFieldConfirm"), okButtonProps: { danger: true }, onOk: () => onChange(withRemovedCustomTag(settings, customTagKeyOf(key)!)) })} /> : null}
+              <Switch
+                size="small"
+                aria-label={t("settings.showField", { name: labelOf(key) })}
+                checked={shown(key)}
+                onChange={(checked) => setShown(key, checked)}
+              />
+              </Space>
+            </>;
+          }
+          const allShown = block.fields.every(shown);
+          return <>
+            <button type="button" className="edit-field-group-open" onClick={() => setOpenBlock(block.key)}>
+              <Text>{t("settings.replayGain")}</Text>
+              <span className="edit-field-tag">{t("settings.fieldGroupTag")}</span>
+            </button>
+            <Switch
+              size="small"
+              aria-label={t("settings.showField", { name: t("settings.replayGain") })}
+              checked={allShown}
+              onChange={(checked) => setMembersShown(block.fields, checked)}
+            />
+          </>;
+        }}
+      />
+
+      <Modal centered
+        open={Boolean(composite)}
+        title={t("settings.replayGain")}
+        footer={null}
+        width={420}
+        onCancel={() => setOpenBlock(undefined)}
+      >
+        <Text type="secondary" className="edit-field-group-hint">{t("settings.groupMembersHint")}</Text>
+        {composite ? (
+          <SortableList
+            items={composite.fields}
+            label={t("settings.replayGain")}
+            labelFor={labelOf}
+            onChange={(members) => onChange({
+              ...settings,
+              editFieldOrder: withEditFieldBlockMembers(settings.editFieldOrder, composite.key, members, settings.editCustomTags),
+            })}
+            renderItem={(field) => <>
+              <Text>{labelOf(field)}</Text>
+              <Switch
+                size="small"
+                aria-label={t("settings.showField", { name: labelOf(field) })}
+                checked={shown(field)}
+                onChange={(checked) => setShown(field, checked)}
+              />
+            </>}
+          />
+        ) : null}
+      </Modal>
+    </>
+  );
 }
 
 function SettingRow({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
@@ -204,4 +400,159 @@ function SettingRow({ title, description, children }: { title: string; descripti
       <div className="setting-row-control">{children}</div>
     </div>
   );
+}
+
+function CleanupKeywordsEditor({ keywords, onChange }: { keywords: string[] | undefined; onChange: (value: string[]) => void }) {
+  const [draft, setDraft] = useState(() => (keywords ?? []).join("\n"));
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => {
+    if (!editing) setDraft((keywords ?? []).join("\n"));
+  }, [keywords, editing]);
+
+  function commit() {
+    const next = normalizeCleanupKeywords(draft.split(/\r?\n/));
+    setDraft(next.join("\n"));
+    onChange(next);
+    setEditing(false);
+  }
+
+  return (
+    <Input.TextArea
+      value={draft}
+      autoSize={{ minRows: 2, maxRows: 6 }}
+      onChange={(event) => setDraft(event.target.value)}
+      onFocus={() => setEditing(true)}
+      onBlur={commit}
+    />
+  );
+}
+
+function BackupExportButton() {
+  const { t } = useTranslation();
+  const { message } = AntApp.useApp();
+  const [busy, setBusy] = useState(false);
+
+  async function handleExport() {
+    let destination: string | null = null;
+    try {
+      destination = await pickSavePath({
+        title: t("settings.exportConfig"),
+        defaultPath: "lyrico-config-backup.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+    } catch {
+      destination = null;
+    }
+    if (!destination) return;
+    setBusy(true);
+    try {
+      await exportConfig(destination);
+      message.success(t("settings.exported"));
+    } catch (error) {
+      message.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <Button icon={<ExportOutlined />} loading={busy} onClick={() => void handleExport()}>{t("settings.exportConfig")}</Button>;
+}
+
+function BackupImportButton({ onImported }: { onImported: () => void }) {
+  const { t } = useTranslation();
+  const { message } = AntApp.useApp();
+  const [busy, setBusy] = useState(false);
+
+  async function handleImport() {
+    let source: string | string[] | null = null;
+    try {
+      source = (await pickPaths({
+        title: t("settings.importConfig"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      }))[0] ?? null;
+    } catch {
+      source = null;
+    }
+    if (typeof source !== "string") return;
+    setBusy(true);
+    try {
+      await importConfig(source);
+      onImported();
+      message.success(t("settings.imported"));
+    } catch (error) {
+      message.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <Button icon={<ImportOutlined />} loading={busy} onClick={() => void handleImport()}>{t("settings.importConfig")}</Button>;
+}
+
+function AppLogsSection() {
+  const { t } = useTranslation();
+  const { message } = AntApp.useApp();
+  const [opening, setOpening] = useState(false);
+  async function openDirectory() {
+    setOpening(true);
+    try { await openLogsDirectory(); }
+    catch (error) { void message.error(String(error)); }
+    finally { setOpening(false); }
+  }
+  return <SettingsSection title={t("settings.logs")}>
+    <SettingRow title={t("settings.logsDirectory")} description={t("settings.logsFileHint")}>
+      <Button icon={<FolderOpenOutlined />} loading={opening} onClick={() => void openDirectory()}>{t("settings.logsOpenDirectory")}</Button>
+    </SettingRow>
+  </SettingsSection>;
+}
+
+const PROJECT_URL = "https://github.com/Replica0110/Lyrico-Desktop";
+const SPONSOR_URL = "https://ifdian.net/a/replica0110";
+
+function AboutSection() {
+  const { t } = useTranslation();
+  const [version, setVersion] = useState("");
+
+  useEffect(() => {
+    getVersion()
+      .then((value) => setVersion(value))
+      .catch(() => setVersion(""));
+  }, []);
+
+  return (
+    <>
+      <SettingsSection>
+        <div className="about-identity">
+          <img className="about-app-icon" src={appIcon} alt="" />
+          <div className="about-identity-copy">
+            <Typography.Title level={4}>Lyrico</Typography.Title>
+            <Text type="secondary">{t("settings.aboutDescription")}</Text>
+          </div>
+        </div>
+        <SettingRow title={t("settings.version")}><Text>{version || "—"}</Text></SettingRow>
+        <SettingRow title={t("settings.projectHomepage")}>
+          <Button onClick={() => void openUrl(PROJECT_URL)}>GitHub</Button>
+        </SettingRow>
+        <SettingRow title={t("settings.reportIssue")}>
+          <Button onClick={() => void openUrl(`${PROJECT_URL}/issues`)}>{t("settings.aboutSubmitIssue")}</Button>
+        </SettingRow>
+        <SettingRow title={t("settings.aboutSupport")}>
+          <Button onClick={() => void openUrl(SPONSOR_URL)}>{t("settings.aboutSupportAction")}</Button>
+        </SettingRow>
+      </SettingsSection>
+      <SettingsSection title={t("settings.contributors")}>
+        <ContributorsSection />
+      </SettingsSection>
+    </>
+  );
+}
+
+function ContributorsSection() {
+  return <div className="contributor-list">{CONTRIBUTORS.map(contributor => <button key={contributor.name} type="button" className="contributor-row" onClick={() => void openUrl(contributor.url)}>
+    <Avatar src={contributor.avatar} size={36}>{contributor.name[0]}</Avatar>
+    <Text>{contributor.name}</Text>
+  </button>)}</div>;
 }

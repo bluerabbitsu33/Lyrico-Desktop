@@ -1,82 +1,424 @@
-import { CheckSquareOutlined, CloudSyncOutlined, CloseOutlined } from "@ant-design/icons";
-import { Button, Checkbox, Flex, Space, Tag, Typography } from "antd";
-import { memo, useCallback } from "react";
+import { Checkbox, Table, Tag, Typography } from "antd";
+import type { TableColumnsType, TableProps } from "antd";
+import type { Reference } from "@rc-component/table";
+import {
+  memo,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type HTMLAttributes,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import type { AudioTrack } from "../app/types";
-import { formatDuration } from "../utils/format";
+import { selectLibraryByKey, selectLibraryCheckbox, type LibrarySelectionClick, type LibrarySelectionKey } from "../domain/librarySelection";
+import { sortTracksBy, type SortState, type TrackSortField } from "../domain/sort";
+import { formatDuration, formatTimestamp } from "../utils/format";
 import { TrackArtwork } from "./TrackArtwork";
+import "./LibraryTable.css";
 
 const { Text } = Typography;
 
-export const LibraryTable = memo(function LibraryTable({ tracks, loading, selectedPath, selectedPaths = [], onSelectTrack, onOpenTrack, onChangeSelectedPaths, selectionMode = false, onChangeSelectionMode, onOpenBatch, showSelectionToolbar = true }: {
+const CHECKBOX_COLUMN_WIDTH = 44;
+const SONG_COLUMN_MIN_WIDTH = 300;
+const MIN_BODY_HEIGHT = 240;
+const FALLBACK_BODY_HEIGHT = 480;
+const FALLBACK_HEADER_HEIGHT = 47;
+const FALLBACK_TABLE_WIDTH = 1280;
+
+const OPTIONAL_COLUMN_WIDTHS = {
+  album: 240,
+  format: 96,
+  duration: 88,
+  modifiedAt: 152,
+  createdAt: 152,
+} as const;
+
+type OptionalColumnKey = keyof typeof OPTIONAL_COLUMN_WIDTHS;
+
+const COLUMN_PRESETS: readonly OptionalColumnKey[][] = [
+  ["album", "format", "duration", "modifiedAt", "createdAt"],
+  ["album", "format", "duration", "modifiedAt"],
+  ["album", "format", "duration"],
+  ["album", "duration"],
+  ["duration"],
+];
+
+function resolveColumnLayout(tableWidth: number) {
+  const fixedKeys = COLUMN_PRESETS.find((preset) => {
+    const fixedWidth = preset.reduce((total, key) => total + OPTIONAL_COLUMN_WIDTHS[key], 0);
+    return CHECKBOX_COLUMN_WIDTH + SONG_COLUMN_MIN_WIDTH + fixedWidth <= tableWidth;
+  }) ?? COLUMN_PRESETS[COLUMN_PRESETS.length - 1];
+  const fixedWidth = fixedKeys.reduce((total, key) => total + OPTIONAL_COLUMN_WIDTHS[key], 0);
+  const songWidth = Math.max(SONG_COLUMN_MIN_WIDTH, tableWidth - CHECKBOX_COLUMN_WIDTH - fixedWidth);
+  return { fixedKeys, songWidth, totalWidth: CHECKBOX_COLUMN_WIDTH + fixedWidth + songWidth };
+}
+
+function findScrollParent(element: HTMLElement) {
+  let parent = element.parentElement;
+  while (parent) {
+    const { overflow, overflowY } = window.getComputedStyle(parent);
+    if (/auto|scroll|overlay/.test(`${overflow}${overflowY}`)) return parent;
+    parent = parent.parentElement;
+  }
+  return undefined;
+}
+
+/**
+ * Rows open the editor; the first-column checkbox toggles selection, with Shift
+ * selecting a range and Ctrl+Shift adding a range.
+ * With the list focused, arrows select one row, Shift+arrows extend the range,
+ * Ctrl+arrows move the cursor, Space toggles it, and Ctrl+A selects this list.
+ * See docs/ui-layout.md (song selection and navigation).
+ */
+export const LibraryTable = memo(function LibraryTable({ tracks, loading, selectedPaths = [], onOpenTrack, onChangeSelectedPaths, sort, onSortChange }: {
   tracks: AudioTrack[];
   loading?: boolean;
-  selectedPath?: string;
   selectedPaths?: string[];
-  onSelectTrack: (path?: string) => void;
-  onOpenTrack?: (track: AudioTrack) => void;
+  onOpenTrack: (track: AudioTrack) => void;
   onChangeSelectedPaths?: (paths: string[]) => void;
-  selectionMode?: boolean;
-  onChangeSelectionMode?: (enabled: boolean) => void;
-  onOpenBatch?: () => void;
-  showSelectionToolbar?: boolean;
+  sort?: SortState<TrackSortField>;
+  onSortChange?: (next?: SortState<TrackSortField>) => void;
 }) {
   const { t } = useTranslation();
-  const toggleTrack = useCallback((track: AudioTrack) => {
-    if (!onChangeSelectedPaths) return;
-    onChangeSelectedPaths(selectedPaths.includes(track.path) ? selectedPaths.filter((path) => path !== track.path) : [...selectedPaths, track.path]);
-  }, [onChangeSelectedPaths, selectedPaths]);
-  const openTrack = useCallback((track: AudioTrack) => {
-    if (selectionMode) toggleTrack(track);
-    else {
-      onSelectTrack(track.path);
-      onOpenTrack?.(track);
+  const [internalSort, setInternalSort] = useState<SortState<TrackSortField>>();
+  const activeSort = onSortChange ? sort : internalSort;
+  const applySort = useCallback((next?: SortState<TrackSortField>) => {
+    if (!onSortChange) setInternalSort(next);
+    onSortChange?.(next);
+  }, [onSortChange]);
+  const sortedTracks = useMemo(
+    () => (activeSort ? sortTracksBy(tracks, activeSort.key, activeSort.direction) : tracks),
+    [tracks, activeSort],
+  );
+
+  const [metrics, setMetrics] = useState({ bodyHeight: FALLBACK_BODY_HEIGHT, tableWidth: FALLBACK_TABLE_WIDTH });
+  const layout = useMemo(() => resolveColumnLayout(metrics.tableWidth), [metrics.tableWidth]);
+  const hostRef = useRef<HTMLDivElement>(null);
+  const tableRef = useRef<Reference>(null);
+
+  useLayoutEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    let frame: number | undefined;
+    const measure = () => {
+      frame = undefined;
+      const tableWidth = Math.round(host.clientWidth);
+      const rect = host.getBoundingClientRect();
+      const scroller = findScrollParent(host);
+      const scrollerRect = scroller?.getBoundingClientRect();
+      const bottom = scrollerRect ? scrollerRect.bottom : window.innerHeight;
+      let gap = 0;
+      let node: HTMLElement | null = host.parentElement;
+      while (node) {
+        const style = window.getComputedStyle(node);
+        gap += parseFloat(style.paddingBottom) || 0;
+        if (node === scroller || node === document.body || node === document.documentElement) break;
+        gap += parseFloat(style.marginBottom) || 0;
+        node = node.parentElement;
+      }
+      const header = host.querySelector<HTMLElement>(".ant-table-header");
+      const headerHeight = header ? header.offsetHeight : FALLBACK_HEADER_HEIGHT;
+      const bodyHeight = Math.max(MIN_BODY_HEIGHT, Math.floor(bottom - rect.top - gap - headerHeight));
+      setMetrics((current) => (
+        current.bodyHeight === bodyHeight && current.tableWidth === tableWidth
+          ? current
+          : { bodyHeight, tableWidth }
+      ));
+    };
+
+    const schedule = () => {
+      if (frame !== undefined) return;
+      frame = window.requestAnimationFrame(measure);
+    };
+
+    measure();
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(schedule);
+    observer?.observe(host);
+
+    return () => {
+      if (frame !== undefined) window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+      observer?.disconnect();
+    };
+  }, [sortedTracks.length, loading, selectedPaths.length]);
+
+  const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  const trackPaths = useMemo(() => sortedTracks.map((track) => track.path), [sortedTracks]);
+  const anchorRef = useRef<number | null>(null);
+  const cursorRef = useRef<number | null>(null);
+  const previousPathsRef = useRef(trackPaths);
+  const [cursorIndex, setCursorIndex] = useState<number | null>(null);
+  const selectedPathsRef = useRef(selectedPaths);
+  const sortedTracksRef = useRef(sortedTracks);
+  const onChangeSelectedPathsRef = useRef(onChangeSelectedPaths);
+  const onOpenTrackRef = useRef(onOpenTrack);
+  selectedPathsRef.current = selectedPaths;
+  sortedTracksRef.current = sortedTracks;
+  onChangeSelectedPathsRef.current = onChangeSelectedPaths;
+  onOpenTrackRef.current = onOpenTrack;
+
+  useLayoutEffect(() => {
+    const previous = previousPathsRef.current;
+    const rebase = (index: number | null) => {
+      if (index === null) return null;
+      const next = trackPaths.indexOf(previous[index]);
+      return next < 0 ? null : next;
+    };
+    anchorRef.current = rebase(anchorRef.current);
+    cursorRef.current = rebase(cursorRef.current);
+    setCursorIndex(cursorRef.current);
+    previousPathsRef.current = trackPaths;
+  }, [trackPaths]);
+
+  const changeSelection = useCallback((next: string[], anchor: number | null) => {
+    anchorRef.current = anchor;
+    if (next !== selectedPathsRef.current) {
+      selectedPathsRef.current = next;
+      onChangeSelectedPathsRef.current?.(next);
     }
-  }, [onOpenTrack, onSelectTrack, selectionMode, toggleTrack]);
+  }, []);
+
+  const rememberCursor = useCallback((index: number) => {
+    cursorRef.current = index;
+    setCursorIndex(index);
+  }, []);
+
+  const selectCheckbox = useCallback((index: number, event: LibrarySelectionClick) => {
+    if (!onChangeSelectedPathsRef.current) return;
+    const result = selectLibraryCheckbox(
+      sortedTracksRef.current.map((item) => item.path),
+      selectedPathsRef.current,
+      anchorRef.current,
+      index,
+      event,
+    );
+    rememberCursor(index);
+    changeSelection(result.selectedPaths, result.anchorIndex);
+  }, [changeSelection, rememberCursor]);
+
+  const onListKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.altKey || event.nativeEvent.isComposing) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.closest("textarea, select, button, a, [role='button'], [contenteditable='true'], .ant-table-thead")) return;
+    if (target instanceof HTMLInputElement && target.type !== "checkbox") return;
+
+    if (event.key === "Enter") {
+      const index = cursorRef.current;
+      const track = index === null ? undefined : sortedTracksRef.current[index];
+      if (!track) return;
+      event.preventDefault();
+      onOpenTrackRef.current(track);
+      return;
+    }
+
+    const moveKey = libraryMoveKey(event.key);
+    if (!moveKey) return;
+    if (moveKey === "a" && (!(event.ctrlKey || event.metaKey) || event.shiftKey)) return;
+    if (!onChangeSelectedPathsRef.current) return;
+    // Consume recognized selection keys even at the first/last row: do not scroll
+    // the page or let a still-focused checkbox toggle a different cursor item.
+    event.preventDefault();
+
+    const result = selectLibraryByKey(
+      sortedTracksRef.current.map((item) => item.path),
+      selectedPathsRef.current,
+      anchorRef.current,
+      cursorRef.current,
+      { key: moveKey, shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey },
+    );
+    if (!result) return;
+    rememberCursor(result.cursorIndex);
+    changeSelection(result.selectedPaths, result.anchorIndex);
+    // Virtual rows can unmount on scrolling; keep focus on the stable list host.
+    hostRef.current?.focus({ preventScroll: true });
+    tableRef.current?.scrollTo({ index: result.cursorIndex });
+  }, [rememberCursor, changeSelection]);
+
+  const onRow = useCallback((track: AudioTrack): HTMLAttributes<HTMLElement> => ({
+    onClick: () => onOpenTrackRef.current(track),
+  }), []);
+
+  const allSelected = sortedTracks.length > 0 && sortedTracks.every((track) => selectedSet.has(track.path));
+  const someSelected = !allSelected && sortedTracks.some((track) => selectedSet.has(track.path));
+
+  const columns = useMemo<TableColumnsType<AudioTrack>>(() => {
+    const unknownArtist = t("common.unknownArtist");
+    const unknownAlbum = t("common.unknownAlbum");
+    const sortOrder = (key: TrackSortField): "ascend" | "descend" | null => (
+      activeSort?.key === key
+        ? (activeSort.direction === "asc" ? "ascend" : "descend")
+        : null
+    );
+    const sortable = (key: TrackSortField) => ({
+      sorter: true as const,
+      sortOrder: sortOrder(key),
+    });
+
+    const list: TableColumnsType<AudioTrack> = [
+      {
+        key: "selection",
+        className: "library-selection-cell",
+        title: (
+          <Checkbox
+            aria-label={t("selection.selectAll")}
+            checked={allSelected}
+            indeterminate={someSelected}
+            disabled={sortedTracks.length === 0 || !onChangeSelectedPaths}
+            onChange={() => changeSelection(allSelected ? [] : trackPaths, null)}
+          />
+        ),
+        width: CHECKBOX_COLUMN_WIDTH,
+        align: "center",
+        render: (_value, track, index) => (
+          <Checkbox
+            aria-label={t("selection.selectRow", { name: track.title || track.fileName })}
+            checked={selectedSet.has(track.path)}
+            disabled={!onChangeSelectedPaths}
+            onFocus={() => rememberCursor(index)}
+            onClick={event => event.stopPropagation()}
+            onChange={event => selectCheckbox(index, event.nativeEvent)}
+          />
+        ),
+      },
+      {
+        key: "title",
+        dataIndex: "title",
+        title: t("table.song"),
+        width: layout.songWidth,
+        ...sortable("title"),
+        render: (_value, track) => (
+          <div className="library-song-cell">
+            <TrackArtwork track={track} size={32} />
+            <div className="track-title-cell">
+              <Text strong ellipsis={{ tooltip: track.title || track.fileName }}>{track.title || track.fileName}</Text>
+              <Text type="secondary" ellipsis={{ tooltip: track.artist }}>{track.artist || unknownArtist}</Text>
+            </div>
+          </div>
+        ),
+      },
+    ];
+
+    if (layout.fixedKeys.includes("album")) {
+      list.push({
+        key: "album",
+        dataIndex: "album",
+        title: t("table.album"),
+        width: OPTIONAL_COLUMN_WIDTHS.album,
+        ellipsis: true,
+        ...sortable("album"),
+        render: (_value, track) => track.album || unknownAlbum,
+      });
+    }
+
+    if (layout.fixedKeys.includes("format")) {
+      list.push({
+        key: "format",
+        dataIndex: "format",
+        title: t("table.format"),
+        width: OPTIONAL_COLUMN_WIDTHS.format,
+        align: "center",
+        ...sortable("format"),
+        render: (_value, track) => (track.format ? <Tag variant="filled" className="library-format-tag">{track.format}</Tag> : "—"),
+      });
+    }
+
+    list.push({
+      key: "duration",
+      title: t("table.duration"),
+      width: OPTIONAL_COLUMN_WIDTHS.duration,
+      align: "right",
+      ...sortable("duration"),
+      render: (_value, track) => <span className="library-number-cell">{formatDuration(track.durationSeconds)}</span>,
+    });
+
+    if (layout.fixedKeys.includes("modifiedAt")) {
+      list.push({
+        key: "modifiedAt",
+        title: t("table.modifiedAt"),
+        width: OPTIONAL_COLUMN_WIDTHS.modifiedAt,
+        align: "right",
+        ...sortable("modifiedAt"),
+        render: (_value, track) => <span className="library-number-cell">{formatTimestamp(track.modifiedAt)}</span>,
+      });
+    }
+
+    if (layout.fixedKeys.includes("createdAt")) {
+      list.push({
+        key: "createdAt",
+        title: t("table.createdAt"),
+        width: OPTIONAL_COLUMN_WIDTHS.createdAt,
+        align: "right",
+        ...sortable("createdAt"),
+        render: (_value, track) => <span className="library-number-cell">{formatTimestamp(track.createdAt)}</span>,
+      });
+    }
+
+    return list;
+  }, [t, activeSort, layout, selectedSet, selectCheckbox, rememberCursor, changeSelection, allSelected, someSelected, trackPaths, sortedTracks.length, onChangeSelectedPaths]);
+
+  const handleTableChange = useCallback<NonNullable<TableProps<AudioTrack>["onChange"]>>(
+    (_pagination, _filters, sorter) => {
+      const result = Array.isArray(sorter) ? sorter[0] : sorter;
+      if (!result || !("order" in result)) return;
+      if (!result.order) {
+        applySort(undefined);
+        return;
+      }
+      if (!result.columnKey) return;
+      const key = result.columnKey as TrackSortField;
+      applySort({ key, direction: result.order === "ascend" ? "asc" : "desc" });
+    },
+    [applySort],
+  );
+
+  const rowClassName = useCallback(
+    (track: AudioTrack, index?: number) => {
+      const classes: string[] = [];
+      if (selectedSet.has(track.path)) classes.push("is-selected");
+      if (index !== undefined && index === cursorIndex) classes.push("is-cursor");
+      return classes.join(" ");
+    },
+    [selectedSet, cursorIndex],
+  );
 
   return (
-    <div className="library-track-list">
-      {showSelectionToolbar && onChangeSelectedPaths && onChangeSelectionMode ? (
-        <Flex className="selection-toolbar" align="center" justify="space-between" gap={12} wrap>
-          {selectionMode ? <>
-            <Space><Button icon={<CloseOutlined />} onClick={() => onChangeSelectionMode(false)}>{t("selection.exit")}</Button><Text>{t("selection.count", { count: selectedPaths.length })}</Text></Space>
-            <Button type="primary" icon={<CloudSyncOutlined />} disabled={selectedPaths.length === 0} onClick={onOpenBatch}>{t("selection.batch")}</Button>
-          </> : <Button icon={<CheckSquareOutlined />} onClick={() => onChangeSelectionMode(true)}>{t("selection.enter")}</Button>}
-        </Flex>
-      ) : null}
-
-      <div className="track-list-heading" aria-hidden="true">
-        <span>#</span><span>{t("table.song")}</span><span>{t("table.album")}</span><span>{t("table.format")}</span><span>{t("table.duration")}</span>
-      </div>
-      <div className="track-list-rows" aria-busy={loading}>
-        {loading && tracks.length === 0
-          ? Array.from({ length: 8 }, (_, index) => <div className="track-row track-row-skeleton" key={index} />)
-          : tracks.map((track, index) => {
-              const selected = selectedPaths.includes(track.path);
-              return <div
-                className={`track-row${track.path === selectedPath ? " is-current" : ""}${selected ? " is-selected" : ""}`}
-                key={track.path}
-                role="button"
-                tabIndex={0}
-                onClick={() => openTrack(track)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openTrack(track); }
-                }}
-              >
-                <div className="track-row-index">{selectionMode ? <Checkbox checked={selected} onClick={(event) => event.stopPropagation()} onChange={() => toggleTrack(track)} /> : <Text type="secondary">{index + 1}</Text>}</div>
-                <div className="track-row-primary">
-                  <TrackArtwork track={track} size={42} />
-                  <div className="track-title-cell">
-                    <Text strong ellipsis={{ tooltip: track.title || track.fileName }}>{track.title || track.fileName}</Text>
-                    <Text type="secondary" ellipsis={{ tooltip: track.artist }}>{track.artist || t("common.unknownArtist")}</Text>
-                  </div>
-                </div>
-                <Text className="track-row-album" type="secondary" ellipsis={{ tooltip: track.album }}>{track.album || t("common.unknownAlbum")}</Text>
-                <div className="track-row-format">{track.format ? <Tag bordered={false}>{track.format}</Tag> : "—"}</div>
-                <Text className="track-row-duration" type="secondary">{formatDuration(track.durationSeconds)}</Text>
-              </div>;
-            })}
+    <div className="library-track-list" aria-busy={loading}>
+      <div
+        className="library-table-host"
+        ref={hostRef}
+        tabIndex={sortedTracks.length > 0 ? 0 : undefined}
+        onKeyDown={onListKeyDown}
+      >
+          <Table
+            ref={tableRef}
+            virtual
+            size="middle"
+            rowKey="path"
+            columns={columns}
+            dataSource={sortedTracks}
+            pagination={false}
+            loading={loading}
+            scroll={{ x: layout.totalWidth, y: metrics.bodyHeight }}
+            onChange={handleTableChange}
+            onRow={onRow}
+            rowClassName={rowClassName}
+          />
       </div>
     </div>
   );
 });
+
+function libraryMoveKey(key: string): LibrarySelectionKey | null {
+  if (key === "ArrowUp" || key === "ArrowDown" || key === "Home" || key === "End") return key;
+  if (key === "a" || key === "A") return "a";
+  if (key === " ") return " ";
+  return null;
+}

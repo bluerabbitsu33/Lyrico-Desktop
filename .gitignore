@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+src-tauri/native/taglib/_deps/
+.playwright-cli/
+build/
+src-tauri/native/ffmpeg/runtime/
+output/

@@ -8,35 +8,97 @@ use std::path::Path;
 use tauri::AppHandle;
 
 const CONFIG_SCHEMA_VERSION: u32 = 5;
+pub(crate) const REPLAY_GAIN_TARGET_MIN_LUFS: f64 = -30.0;
+pub(crate) const REPLAY_GAIN_TARGET_MAX_LUFS: f64 = 0.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct DesktopSettings {
     pub(crate) search_page_size: u32,
     pub(crate) replay_gain_target_loudness: f64,
+    pub(crate) replay_gain_peak_mode: crate::replay_gain::PeakMode,
     pub(crate) lyric_format: String,
     pub(crate) lyrics_conversion_mode: String,
     pub(crate) show_translation: bool,
     pub(crate) show_romanization: bool,
     pub(crate) only_translation_if_available: bool,
     pub(crate) remove_empty_lyric_lines: bool,
+    pub(crate) lyric_line_order: Vec<String>,
+    pub(crate) remove_tag_line_keywords: Vec<String>,
+    pub(crate) ignore_short_audio: bool,
+    pub(crate) lyric_index_enabled: bool,
+    pub(crate) hidden_folder_paths: Vec<String>,
+    pub(crate) artist_poster_folder: String,
     pub(crate) rename_character_mappings: BTreeMap<String, String>,
-    pub(crate) theme: String,
+    #[serde(alias = "theme")]
+    pub(crate) theme_mode: String,
+    pub(crate) edit_field_visibility: BTreeMap<String, bool>,
+    pub(crate) edit_field_order: Vec<String>,
+    pub(crate) edit_custom_tags: Vec<String>,
+    pub(crate) library_sorts: BTreeMap<String, LibrarySort>,
+    pub(crate) batch_operation: String,
+    pub(crate) close_to_tray: bool,
+    pub(crate) close_to_tray_prompted: bool,
 }
+
+/// 列表页排序偏好：key/direction 的取值合法性由前端校验（字段清单只在前端维护）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibrarySort {
+    pub(crate) key: String,
+    pub(crate) direction: String,
+}
+
+pub(crate) const EDIT_FIELD_KEYS: &[&str] = &[
+    "title",
+    "artist",
+    "albumArtist",
+    "album",
+    "year",
+    "language",
+    "genre",
+    "trackNumber",
+    "discNumber",
+    "composer",
+    "lyricist",
+    "copyright",
+    "comment",
+    "rating",
+    "lyrics",
+    "replayGainTrackGain",
+    "replayGainTrackPeak",
+    "replayGainAlbumGain",
+    "replayGainAlbumPeak",
+    "replayGainReferenceLoudness",
+];
 
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             search_page_size: 10,
-            replay_gain_target_loudness: -18.0,
+            replay_gain_target_loudness: crate::replay_gain::DEFAULT_TARGET_LOUDNESS_LUFS,
+            replay_gain_peak_mode: crate::replay_gain::PeakMode::default(),
             lyric_format: "verbatimLrc".to_string(),
             lyrics_conversion_mode: "none".to_string(),
             show_translation: true,
             show_romanization: true,
             only_translation_if_available: false,
             remove_empty_lyric_lines: true,
+            lyric_line_order: default_lyric_line_order(),
+            remove_tag_line_keywords: Vec::new(),
+            ignore_short_audio: false,
+            lyric_index_enabled: true,
+            hidden_folder_paths: Vec::new(),
+            artist_poster_folder: String::new(),
             rename_character_mappings: default_rename_character_mappings(),
-            theme: "system".to_string(),
+            theme_mode: "system".to_string(),
+            edit_field_visibility: BTreeMap::new(),
+            edit_field_order: default_edit_field_order(),
+            edit_custom_tags: Vec::new(),
+            library_sorts: BTreeMap::new(),
+            batch_operation: "replaygain".to_string(),
+            close_to_tray: false,
+            close_to_tray_prompted: false,
         }
     }
 }
@@ -60,24 +122,23 @@ impl Default for AppConfig {
 }
 
 pub(crate) fn load_desktop_settings(app: &AppHandle) -> Result<DesktopSettings, String> {
-    let mut settings = load_config(app)?.settings;
-    settings.rename_character_mappings = normalize_rename_character_mappings(std::mem::take(
-        &mut settings.rename_character_mappings,
-    ));
-    Ok(settings)
+    Ok(normalize_settings(load_config(app)?.settings))
 }
 
 pub(crate) fn save_desktop_settings(
     app: &AppHandle,
-    mut settings: DesktopSettings,
+    settings: DesktopSettings,
 ) -> Result<(), String> {
+    let settings = normalize_settings(settings);
+    let mut config = load_config(app)?;
+    config.schema_version = CONFIG_SCHEMA_VERSION;
+    config.settings = settings;
+    write_json(&resolve_data_paths(app)?.settings, &config)?;
+    Ok(())
+}
+
+fn normalize_settings(mut settings: DesktopSettings) -> DesktopSettings {
     settings.search_page_size = settings.search_page_size.clamp(5, 50);
-    if !settings.replay_gain_target_loudness.is_finite()
-        || !(-60.0..=0.0).contains(&settings.replay_gain_target_loudness)
-    {
-        settings.replay_gain_target_loudness =
-            DesktopSettings::default().replay_gain_target_loudness;
-    }
     if !matches!(
         settings.lyric_format.as_str(),
         "plainLrc" | "verbatimLrc" | "enhancedLrc" | "ttml"
@@ -93,13 +154,44 @@ pub(crate) fn save_desktop_settings(
     settings.rename_character_mappings = normalize_rename_character_mappings(std::mem::take(
         &mut settings.rename_character_mappings,
     ));
-    if !matches!(settings.theme.as_str(), "light" | "dark" | "system") {
-        settings.theme = DesktopSettings::default().theme;
+    settings.lyric_line_order =
+        normalize_lyric_line_order(std::mem::take(&mut settings.lyric_line_order));
+    settings.remove_tag_line_keywords =
+        normalize_cleanup_keywords(std::mem::take(&mut settings.remove_tag_line_keywords));
+    settings.hidden_folder_paths =
+        normalize_folder_paths(std::mem::take(&mut settings.hidden_folder_paths));
+    settings.artist_poster_folder = settings.artist_poster_folder.trim().to_string();
+    settings.edit_custom_tags = normalize_custom_tag_keys(settings.edit_custom_tags);
+    let custom_codes: Vec<String> = settings
+        .edit_custom_tags
+        .iter()
+        .map(|key| format!("tag:{key}"))
+        .collect();
+    let order = std::mem::take(&mut settings.edit_field_order)
+        .into_iter()
+        .map(normalize_edit_field_code)
+        .collect();
+    settings.edit_field_order = normalize_edit_field_order_with_custom(order, &custom_codes);
+    if !matches!(settings.theme_mode.as_str(), "system" | "light" | "dark") {
+        settings.theme_mode = DesktopSettings::default().theme_mode;
     }
-    let mut config = load_config(app)?;
-    config.schema_version = CONFIG_SCHEMA_VERSION;
-    config.settings = settings;
-    write_json(&resolve_data_paths(app)?.settings, &config)
+    if !settings.replay_gain_target_loudness.is_finite() {
+        settings.replay_gain_target_loudness =
+            DesktopSettings::default().replay_gain_target_loudness;
+    }
+    settings.replay_gain_target_loudness = settings
+        .replay_gain_target_loudness
+        .clamp(REPLAY_GAIN_TARGET_MIN_LUFS, REPLAY_GAIN_TARGET_MAX_LUFS);
+    settings.edit_field_visibility = settings
+        .edit_field_visibility
+        .into_iter()
+        .map(|(key, value)| (normalize_edit_field_code(key), value))
+        .filter(|(key, _)| EDIT_FIELD_KEYS.contains(&key.as_str()) || custom_codes.contains(key))
+        .collect();
+    settings
+        .library_sorts
+        .retain(|_, sort| !sort.key.is_empty() && matches!(sort.direction.as_str(), "asc" | "desc"));
+    settings
 }
 
 fn default_rename_character_mappings() -> BTreeMap<String, String> {
@@ -117,6 +209,146 @@ fn default_rename_character_mappings() -> BTreeMap<String, String> {
     .into_iter()
     .map(|(character, replacement)| (character.to_string(), replacement.to_string()))
     .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginBackup {
+    pub(crate) id: String,
+    pub(crate) enabled: bool,
+    pub(crate) sort_order: i32,
+    pub(crate) settings_json: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ConfigBackup {
+    schema_version: u32,
+    artist_split: ArtistSplitConfig,
+    settings: DesktopSettings,
+    plugins: Vec<PluginBackup>,
+}
+
+fn default_lyric_line_order() -> Vec<String> {
+    ["original", "romanization", "translation"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_lyric_line_order(order: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in order.into_iter().chain(
+        ["original", "romanization", "translation"]
+            .into_iter()
+            .map(str::to_string),
+    ) {
+        if matches!(value.as_str(), "original" | "translation" | "romanization")
+            && !normalized.iter().any(|item| item == &value)
+        {
+            normalized.push(value);
+        }
+    }
+    normalized
+}
+
+fn normalize_cleanup_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for keyword in keywords {
+        let keyword = keyword.trim();
+        if !keyword.is_empty() && !normalized.iter().any(|item| item == keyword) {
+            normalized.push(keyword.to_string());
+        }
+    }
+    normalized
+}
+
+fn normalize_folder_paths(paths: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for path in paths {
+        let path = path.trim();
+        if !path.is_empty()
+            && !normalized
+                .iter()
+                .any(|item: &String| item.eq_ignore_ascii_case(path))
+        {
+            normalized.push(path.to_string());
+        }
+    }
+    normalized
+}
+
+fn default_edit_field_order() -> Vec<String> {
+    EDIT_FIELD_KEYS.iter().map(|key| key.to_string()).collect()
+}
+
+pub(crate) fn normalize_custom_tag_key(input: &str) -> Option<String> {
+    let key = input.trim();
+    if key.is_empty() || key.encode_utf16().count() > 64 || key.contains(['\r', '\n']) {
+        None
+    } else {
+        Some(key.to_uppercase())
+    }
+}
+
+fn normalize_edit_field_code(code: String) -> String {
+    code.strip_prefix("tag:")
+        .and_then(normalize_custom_tag_key)
+        .map(|key| format!("tag:{key}"))
+        .unwrap_or(code)
+}
+
+fn normalize_custom_tag_keys(keys: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for key in keys.iter().filter_map(|key| normalize_custom_tag_key(key)) {
+        if !normalized.contains(&key) {
+            normalized.push(key);
+        }
+    }
+    normalized
+}
+
+fn normalize_edit_field_order_with_custom(
+    order: Vec<String>,
+    custom_codes: &[String],
+) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in order
+        .into_iter()
+        .chain(default_edit_field_order())
+        .chain(custom_codes.iter().cloned())
+    {
+        let expanded: Vec<&str> = match value.as_str() {
+            "basic" => vec![
+                "title",
+                "artist",
+                "albumArtist",
+                "album",
+                "year",
+                "language",
+                "genre",
+            ],
+            "track" => vec!["trackNumber", "discNumber"],
+            "credits" => vec!["composer", "lyricist", "copyright", "comment"],
+            "replaygain" => vec![
+                "replayGainTrackGain",
+                "replayGainTrackPeak",
+                "replayGainAlbumGain",
+                "replayGainAlbumPeak",
+                "replayGainReferenceLoudness",
+            ],
+            "cover" => vec!["rating"],
+            key => vec![key],
+        };
+        for key in expanded {
+            if (EDIT_FIELD_KEYS.contains(&key) || custom_codes.iter().any(|code| code == key))
+                && !normalized.iter().any(|item| item == key)
+            {
+                normalized.push(key.to_string());
+            }
+        }
+    }
+    normalized
 }
 
 fn normalize_rename_character_mappings(
@@ -146,6 +378,45 @@ pub(crate) fn save_artist_split_config(
     write_json(&path, &config)
 }
 
+pub(crate) fn export_config(
+    app: &AppHandle,
+    destination: &Path,
+    plugins: Vec<PluginBackup>,
+) -> Result<(), String> {
+    let config = load_config(app)?;
+    write_json(
+        destination,
+        &ConfigBackup {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            artist_split: config.artist_split,
+            settings: normalize_settings(config.settings),
+            plugins,
+        },
+    )
+}
+
+pub(crate) fn import_config(
+    app: &AppHandle,
+    source: &Path,
+) -> Result<(DesktopSettings, Vec<PluginBackup>), String> {
+    let contents = fs::read_to_string(source).map_err(|error| error.to_string())?;
+    let mut backup: ConfigBackup = serde_json::from_str(&contents).map_err(|error| {
+        format!(
+            "Failed to parse the configuration backup at {}: {error}",
+            source.display()
+        )
+    })?;
+    backup.schema_version = CONFIG_SCHEMA_VERSION;
+    let mut config = AppConfig {
+        schema_version: backup.schema_version,
+        artist_split: backup.artist_split,
+        settings: backup.settings,
+    };
+    config.settings = normalize_settings(config.settings);
+    write_json(&resolve_data_paths(app)?.settings, &config)?;
+    Ok((load_desktop_settings(app)?, backup.plugins))
+}
+
 pub(crate) fn migrate_legacy_artist_split_config(
     app: &AppHandle,
     legacy_value: Option<String>,
@@ -171,11 +442,45 @@ pub(crate) fn migrate_legacy_artist_split_config(
 }
 
 fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
-    let path = resolve_data_paths(app)?.settings;
+    load_config_from(&resolve_data_paths(app)?.settings)
+}
+
+fn load_config_from(path: &Path) -> Result<AppConfig, String> {
+    let backup = path.with_extension("json.bak");
     if !path.exists() {
+        if backup.exists() {
+            crate::logging::event(
+                log::Level::Warn,
+                "config",
+                "backup.recovery",
+                serde_json::json!({"reason":"primary configuration missing"}),
+            );
+            return parse_config_file(&backup).map_err(|error| {
+                format!(
+                    "Application configuration at {} is missing and the backup at {} could not be read: {error}",
+                    path.display(),
+                    backup.display()
+                )
+            });
+        }
         return Ok(AppConfig::default());
     }
-    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    parse_config_file(path).or_else(|error| {
+        if !backup.exists() {
+            return Err(error);
+        }
+        crate::logging::event(
+            log::Level::Warn,
+            "config",
+            "backup.recovery",
+            serde_json::json!({"error":error}),
+        );
+        parse_config_file(&backup).map_err(|_| error)
+    })
+}
+
+fn parse_config_file(path: &Path) -> Result<AppConfig, String> {
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     serde_json::from_str(&contents).map_err(|error| {
         format!(
             "Failed to parse application configuration at {}: {error}",
@@ -198,39 +503,48 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     file.sync_all().map_err(|error| error.to_string())?;
     if path.exists() {
         fs::copy(path, &backup).map_err(|error| error.to_string())?;
-        fs::remove_file(path).map_err(|error| error.to_string())?;
     }
     fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
-mod tests {
+mod custom_field_tests {
     use super::*;
 
     #[test]
-    fn rename_character_mappings_keep_explicit_removals_and_drop_unknown_keys() {
-        let mappings = BTreeMap::from([
-            ("/".to_string(), String::new()),
-            (":".to_string(), "-".to_string()),
-            ("x".to_string(), "ignored".to_string()),
-        ]);
-        let normalized = normalize_rename_character_mappings(mappings);
-        assert_eq!(normalized.get("/"), Some(&String::new()));
-        assert_eq!(normalized.get(":"), Some(&"-".to_string()));
-        assert_eq!(normalized.get("?"), Some(&"？".to_string()));
-        assert!(!normalized.contains_key("x"));
+    fn configured_custom_fields_survive_round_trip_and_keep_visibility_and_order() {
+        let settings: DesktopSettings = serde_json::from_value(serde_json::json!({
+            "editCustomTags": [" mood ", "MOOD", "LABEL", "", "bad\nkey"],
+            "editFieldOrder": ["tag:label", "title", "tag:mood", "tag:DELETED"],
+            "editFieldVisibility": { "tag:mood": false, "tag:DELETED": false }
+        }))
+        .unwrap();
+        let normalized = normalize_settings(settings);
+        let restored = normalize_settings(
+            serde_json::from_str(&serde_json::to_string(&normalized).unwrap()).unwrap(),
+        );
+        assert_eq!(restored.edit_custom_tags, ["MOOD", "LABEL"]);
+        assert_eq!(
+            &restored.edit_field_order[..3],
+            ["tag:LABEL", "title", "tag:MOOD"]
+        );
+        assert_eq!(restored.edit_field_visibility.get("tag:MOOD"), Some(&false));
+        assert!(!restored
+            .edit_field_order
+            .contains(&"tag:DELETED".to_string()));
+        assert!(!restored.edit_field_visibility.contains_key("tag:DELETED"));
     }
 
     #[test]
-    fn old_settings_json_receives_default_rename_mappings() {
-        let settings: DesktopSettings = serde_json::from_str(
-            r#"{"searchPageSize":10,"lyricFormat":"verbatimLrc","lyricsConversionMode":"none"}"#,
-        )
-        .expect("legacy settings should deserialize through defaults");
+    fn old_settings_keep_defaults_and_custom_key_validation_matches_mobile() {
+        let settings = normalize_settings(serde_json::from_str("{}").unwrap());
+        assert!(settings.edit_custom_tags.is_empty());
+        assert_eq!(settings.edit_field_order, default_edit_field_order());
         assert_eq!(
-            settings.rename_character_mappings.get("/"),
-            Some(&"／".to_string())
+            normalize_custom_tag_key("  mood  "),
+            Some("MOOD".to_string())
         );
-        assert_eq!(settings.replay_gain_target_loudness, -18.0);
+        assert!(normalize_custom_tag_key(&"a".repeat(65)).is_none());
+        assert!(normalize_custom_tag_key("a\nb").is_none());
     }
 }

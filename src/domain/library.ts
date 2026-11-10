@@ -1,4 +1,6 @@
 import type { ArtistSplitConfig, AudioTrack, BatchCandidate, LibraryFolder } from "../app/types";
+import { normalizedArtistKey } from "./artistKey";
+import { deduplicateFolders } from "./libraryFolders";
 
 const searchTextCache = new WeakMap<AudioTrack, string>();
 
@@ -57,12 +59,9 @@ export function groupAlbums(tracks: AudioTrack[]): AlbumGroup[] {
   const groups = new Map<string, AudioTrack[]>();
   for (const track of tracks) {
     const key = `${track.album || "Unknown Album"}\u0000${track.albumArtist || track.artist || "Unknown Artist"}`;
-    let group = groups.get(key);
-    if (!group) {
-      group = [];
-      groups.set(key, group);
-    }
-    group.push(track);
+    const group = groups.get(key);
+    if (group) group.push(track);
+    else groups.set(key, [track]);
   }
 
   return [...groups.entries()]
@@ -97,12 +96,6 @@ export const builtinArtistSeparators = [
   { id: "featuring", value: " featuring ", defaultEnabled: false, displayName: "featuring" },
 ] as const;
 
-export const builtinNoSplitArtists = [
-  { id: "simon_and_garfunkel", name: "Simon & Garfunkel", defaultEnabled: true },
-  { id: "earth_wind_and_fire", name: "Earth, Wind & Fire", defaultEnabled: true },
-  { id: "bump_of_chicken", name: "BUMP OF CHICKEN", defaultEnabled: true },
-] as const;
-
 export const defaultArtistSplitConfig: ArtistSplitConfig = {
   enabled: true,
   artistSeparator: "/",
@@ -114,23 +107,13 @@ export const defaultArtistSplitConfig: ArtistSplitConfig = {
 };
 
 export function groupArtists(tracks: AudioTrack[], config: ArtistSplitConfig = defaultArtistSplitConfig): ArtistGroup[] {
-  const separators = effectiveArtistSeparators(config).sort((left, right) => right.length - left.length);
-  const noSplitArtists = effectiveNoSplitArtists(config);
-  const protectedArtists = noSplitArtists
-    .filter((artist) => separators.some((separator) => includesIgnoreCase(artist, separator)))
-    .sort((left, right) => right.length - left.length);
-  const noSplitKeys = new Set(noSplitArtists.map(normalizedArtistKey));
-
   const groups = new Map<string, AudioTrack[]>();
   for (const track of tracks) {
     const rawArtist = track.artist || track.albumArtist || "Unknown Artist";
-    for (const artist of splitArtistsCached(rawArtist, separators, protectedArtists, noSplitKeys)) {
-      let group = groups.get(artist);
-      if (!group) {
-        group = [];
-        groups.set(artist, group);
-      }
-      group.push(track);
+    for (const artist of splitArtists(rawArtist, config)) {
+      const group = groups.get(artist);
+      if (group) group.push(track);
+      else groups.set(artist, [track]);
     }
   }
 
@@ -164,20 +147,6 @@ export function splitArtists(rawArtist: string | undefined, config: ArtistSplitC
   const protectedArtists = noSplitArtists
     .filter((artist) => separators.some((separator) => includesIgnoreCase(artist, separator)))
     .sort((left, right) => right.length - left.length);
-  const noSplitKeys = new Set(noSplitArtists.map(normalizedArtistKey));
-
-  return splitArtistsCached(raw, separators, protectedArtists, noSplitKeys);
-}
-
-function splitArtistsCached(
-  raw: string,
-  separators: string[],
-  protectedArtists: string[],
-  noSplitKeys: Set<string>,
-): string[] {
-  if (!raw) return [];
-  if (noSplitKeys.has(normalizedArtistKey(raw))) return [raw];
-  if (separators.length === 0) return [raw];
 
   const artists: string[] = [];
   let current = "";
@@ -205,48 +174,17 @@ function splitArtistsCached(
 
 export function effectiveArtistSeparators(config: ArtistSplitConfig) {
   const hidden = new Set(config.hiddenBuiltinSeparatorIds);
-  const result: string[] = [];
-  const seen = new Set<string>();
-  for (const item of builtinArtistSeparators) {
-    if (hidden.has(item.id)) continue;
-    if (!(config.builtinSeparatorOverrides[item.id] ?? item.defaultEnabled)) continue;
-    const value = item.value.trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    result.push(value);
-  }
-  for (const item of config.customSeparators) {
-    if (!item.enabled) continue;
-    const value = item.value.trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    result.push(value);
-  }
-  return result;
+  const builtin = builtinArtistSeparators
+    .filter((item) => !hidden.has(item.id))
+    .filter((item) => config.builtinSeparatorOverrides[item.id] ?? item.defaultEnabled)
+    .map((item) => item.value);
+  const custom = config.customSeparators.filter((item) => item.enabled).map((item) => item.value);
+  return [...builtin, ...custom].filter((value) => value.trim()).filter((value, index, all) => all.findIndex((candidate) => candidate.trim() === value.trim()) === index);
 }
 
 export function effectiveNoSplitArtists(config: ArtistSplitConfig) {
-  const result: string[] = [];
-  const seen = new Set<string>();
-  for (const item of builtinNoSplitArtists) {
-    if (!(config.builtinNoSplitArtistOverrides[item.id] ?? item.defaultEnabled)) continue;
-    const value = item.name.trim();
-    if (!value || seen.has(normalizedArtistKey(value))) continue;
-    seen.add(normalizedArtistKey(value));
-    result.push(value);
-  }
-  for (const item of config.customNoSplitArtists) {
-    if (!item.enabled) continue;
-    const value = item.name.trim();
-    if (!value || seen.has(normalizedArtistKey(value))) continue;
-    seen.add(normalizedArtistKey(value));
-    result.push(value);
-  }
-  return result;
-}
-
-function normalizedArtistKey(value: string) {
-  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+  const custom = config.customNoSplitArtists.filter((item) => item.enabled).map((item) => item.name);
+  return custom.filter((value) => value.trim()).filter((value, index, all) => all.findIndex((candidate) => normalizedArtistKey(candidate) === normalizedArtistKey(value)) === index);
 }
 
 function startsWithIgnoreCase(input: string, value: string, index: number) {
@@ -268,7 +206,7 @@ export function tracksInFolder(tracks: AudioTrack[], folder: LibraryFolder) {
 }
 
 export function buildLibraryFolderTree(folders: LibraryFolder[], tracks: AudioTrack[]) {
-  return folders.map((folder) => buildFolderRoot(folder, tracks));
+  return deduplicateFolders(folders).map((folder) => buildFolderRoot(folder, tracks));
 }
 
 export function tracksInDirectory(tracks: AudioTrack[], directoryPath: string, includeSubfolders: boolean) {
@@ -314,10 +252,14 @@ function buildFolderRoot(folder: LibraryFolder, tracks: AudioTrack[]): LibraryFo
   const root = createFolderNode(rootPath, rootPath, undefined);
   const nodes = new Map<string, LibraryFolderNode>([[root.key, root]]);
   const rootPrefix = root.key.endsWith("/") ? root.key : `${root.key}/`;
+  const seen = new Set<string>();
 
   for (const track of tracks) {
     const trackPath = normalizeFileSystemPath(track.path);
     if (!trackPath.toLocaleLowerCase().startsWith(rootPrefix)) continue;
+    const trackKey = trackPath.toLocaleLowerCase();
+    if (seen.has(trackKey)) continue;
+    seen.add(trackKey);
     const directory = parentDirectory(trackPath);
     const relativeDirectory = directory.slice(rootPath.length).replace(/^\/+/, "");
     let parent = root;

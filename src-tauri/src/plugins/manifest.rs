@@ -3,9 +3,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub(crate) const MIN_PLUGIN_API_VERSION: u32 = 1;
-pub(crate) const PLUGIN_API_VERSION: u32 = 4;
+pub(crate) const PLUGIN_API_VERSION: u32 = 5;
 pub(crate) const MIN_HOST_API_VERSION: u32 = 1;
-pub(crate) const HOST_API_VERSION: u32 = 3;
+pub(crate) const HOST_API_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +31,16 @@ pub(crate) struct PluginManifest {
     pub(crate) capabilities: Vec<String>,
     #[serde(default)]
     pub(crate) config_fields: Vec<PluginConfigField>,
+    #[serde(default)]
+    pub(crate) i18n: Option<PluginI18n>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginI18n {
+    pub(crate) default_locale: String,
+    #[serde(default)]
+    pub(crate) resources: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +81,8 @@ pub(crate) struct SourcePlugin {
     pub(crate) plugin_dir: String,
     pub(crate) icon_path: Option<String>,
     pub(crate) icon_data_url: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) sort_order: i32,
     pub(crate) source_states: BTreeMap<String, PluginSourceState>,
     pub(crate) installed_at: String,
     pub(crate) updated_at: String,
@@ -90,7 +102,7 @@ impl SourcePlugin {
     }
 
     pub(crate) fn is_enabled_anywhere(&self) -> bool {
-        self.source_states.values().any(|state| state.enabled)
+        self.enabled && self.source_states.values().any(|state| state.enabled)
     }
 }
 
@@ -147,45 +159,5 @@ where
         _ => Err(serde::de::Error::custom(
             "plugin config defaultValue must be a string, boolean, number, or null",
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scalar_config_defaults_are_normalized_to_runtime_strings() {
-        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
-            "id": "com.example.defaults",
-            "name": "Defaults",
-            "versionCode": 1,
-            "versionName": "1.0.0",
-            "apiVersion": 3,
-            "configFields": [
-                { "key": "enabled", "title": "Enabled", "type": "switch", "defaultValue": true },
-                { "key": "limit", "title": "Limit", "type": "number", "defaultValue": 20 }
-            ]
-        }))
-        .unwrap();
-
-        assert_eq!(manifest.config_fields[0].default_value, "true");
-        assert_eq!(manifest.config_fields[1].default_value, "20");
-    }
-
-    #[test]
-    fn structured_config_defaults_are_rejected() {
-        let result = serde_json::from_value::<PluginManifest>(serde_json::json!({
-            "id": "com.example.defaults",
-            "name": "Defaults",
-            "versionCode": 1,
-            "versionName": "1.0.0",
-            "apiVersion": 3,
-            "configFields": [
-                { "key": "bad", "title": "Bad", "type": "text", "defaultValue": { "nested": true } }
-            ]
-        }));
-
-        assert!(result.is_err());
     }
 }

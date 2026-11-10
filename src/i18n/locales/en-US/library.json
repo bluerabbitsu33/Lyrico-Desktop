@@ -1,4 +1,7 @@
 {
+  "library": {
+    "loadingMore": "Loading more"
+  },
   "scanProgress": {
     "phase": {
       "enumerating": "Discovering audio files",
@@ -10,9 +13,6 @@
   },
   "selection": {
     "enter": "Select songs",
-    "selectAlbums": "Select albums",
-    "selectArtists": "Select artists",
-    "exit": "Exit selection",
     "count_one": "1 song selected",
     "count_other": "{{count}} songs selected",
     "batch": "Batch process",
@@ -20,17 +20,17 @@
     "selectedSongs": "Selected songs",
     "drawerTitle": "Selected songs ({{count}})",
     "clear": "Clear selection",
-    "empty": "No songs selected"
+    "selectAll": "Select all",
+    "selectRow": "Select {{name}}",
+    "empty": "No songs selected",
+    "search": "Search selected songs"
   },
   "songs": {
+    "refreshLibrary": "Refresh library",
+    "noResults": "No matching songs",
+    "clearSearch": "Clear search",
     "title": "Songs",
-    "description": "Browse songs and edit embedded tags.",
-    "edit": "Edit tags",
-    "reloadHint": "Reload the selected file from disk",
-    "reloadAria": "Reload selected song",
-    "all": "All songs",
-    "selected": "{{count}} selected",
-    "empty": "Add a library folder from Folders"
+    "empty": "No music folders yet"
   },
   "table": {
     "song": "Song",
@@ -38,44 +38,50 @@
     "track": "Track",
     "duration": "Duration",
     "format": "Format",
-    "range": "{{start}}–{{end}} of {{total}}"
+    "modifiedAt": "Modified",
+    "createdAt": "Date created"
+  },
+  "sort": {
+    "label": "Sort",
+    "asc": "Ascending",
+    "desc": "Descending",
+    "field": {
+      "title": "Title",
+      "artist": "Artist",
+      "album": "Album",
+      "name": "Name",
+      "trackCount": "Tracks",
+      "albumCount": "Albums",
+      "format": "Format",
+      "duration": "Duration",
+      "modifiedAt": "Modified",
+      "createdAt": "Date created",
+      "lastScan": "Last scan"
+    },
+    "default": "Default order"
   },
   "albums": {
-    "title": "Albums",
-    "description": "Browse albums in your local library.",
-    "all": "All albums",
-    "selected": "{{count}} songs selected",
-    "drawer": "Album tracks"
+    "title": "Albums"
   },
   "artists": {
-    "title": "Artists",
-    "description": "Browse artists in your local library.",
-    "all": "All artists",
-    "selected": "{{count}} songs selected",
-    "drawer": "Artist songs"
+    "title": "Artists"
   },
   "folders": {
     "title": "Folders",
-    "description": "Manage library roots and browse the songs stored in each folder.",
     "add": "Add folders",
-    "configured": "{{count}} configured",
-    "libraryRoots": "Library folders",
-    "folder": "Folder",
-    "lastScan": "Last scan",
-    "lastScanValue": "Last scan: {{value}}",
     "rescan": "Rescan folder",
-    "rescanRoot": "Rescan root",
     "remove": "Remove from library",
-    "removeRoot": "Remove root",
-    "empty": "Add one or more music folders to build your library.",
-    "tracksTitle": "Folder songs",
-    "includeSubfolders": "Include subfolders",
-    "currentFolderOnly": "Current folder only",
-    "searchPlaceholder": "Search this folder",
-    "status": {
-      "ready": "Ready",
-      "scanning": "Scanning",
-      "error": "Error"
-    }
+    "removeConfirm": "Remove \"{{name}}\" from the library? Files on disk are not deleted.",
+    "hide": "Hide from library",
+    "show": "Show in library",
+    "hidden": "Hidden",
+    "subfolderCount_one": "1 subfolder",
+    "subfolderCount_other": "{{count}} subfolders",
+    "status": { "ready": "Scanned", "scanning": "Scanning", "error": "Scan failed" },
+    "empty": "No folders yet",
+    "searchPlaceholder": "Search folders",
+    "searchSongs": "Search songs",
+    "allFolders": "All folders",
+    "noContents": "No audio files or subfolders"
   }
 }
